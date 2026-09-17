@@ -123,6 +123,31 @@ semantics) and `attention` (stuck / over-budget signals needing an
 owner). Reconcile never claims, launches, or guesses — it proposes and
 pages; the operator (or a later scheduler phase) performs.
 
+## Capacity gating (P3+ host capacity, issue #19)
+
+After the collision pass, `plan_board` gates on host load — see
+[docs/capacity.md](capacity.md) for the policy. Admission posture comes
+from loaded owned sessions vs the ceiling (`open` / `limited` /
+`closed`); past the gate no new lane proposes — gated specs park as
+`queued` with the loaded-vs-ceiling evidence cited in `queuedBehind`,
+and reconcile surfaces them as `queued` actions with the same reason.
+Under `limited` only the top-ranked scheduled spec keeps its slot.
+`in-sync`, collision-`queued`, `requeue`, and `page-human` are
+unaffected. Every plan carries a `capacity` block (`loaded`, `ceiling`,
+`warnAt`, `posture`, `evidence`).
+
+```bash
+scripts/m8s board plan --board board.json --loaded 19
+scripts/m8s board plan --board board.json --loaded 19 --ceiling 20 --warn-at 15
+scripts/m8s board reconcile --board board.json --loaded 19
+```
+
+`loaded` defaults to the live P4 lease count (a conservative
+daemonless floor); pass the true roster count when known. Reconcile
+additionally emits a `host.capacity.warning` event whenever loaded is
+at/above the warn threshold — the pre-ceiling signal, below the
+rejection point.
+
 **Cadence** (documented, operator-owned): run
 `scripts/m8s board reconcile --board <snapshot>` on a planning timer
 (cron/systemd, suggested every 15 minutes) after refreshing the snapshot

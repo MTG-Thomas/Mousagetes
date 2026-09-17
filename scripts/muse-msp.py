@@ -1220,6 +1220,121 @@ DECISION_BODY_MARKERS = (
 )
 
 
+# Host capacity planning (issue #19): a single host holds ~20-32 owned
+# sessions before `session/start` begins rejecting with loaded-session
+# capacity exhausted (retryable). The ceiling below is the dispatch-side
+# guardrail — deliberately under the observed failure band — and every
+# value is overridable per host without a code change.
+HOST_SESSION_CEILING_DEFAULT = 20
+
+# Pre-ceiling alert fraction: warn when loaded reaches this share of the
+# ceiling so supervisors shed load before launches start failing.
+HOST_SESSION_WARN_FRACTION = 0.75
+
+CAPACITY_POSTURES = ("open", "limited", "closed")
+
+# Surfaced event kind for the pre-ceiling alert (signal, not rejection).
+CAPACITY_WARNING_KIND = "host.capacity.warning"
+
+# Standby window before an idle lane may unload: duty-complete lanes stay
+# resident this long for review/CI follow-up, then become unload-eligible.
+UNLOAD_STANDBY_SECONDS = 30 * 60
+
+
+def session_ceiling(raw: Any = None) -> int:
+    """Owned-session ceiling for this host. Explicit ``raw`` wins, then
+    ``M8S_SESSION_CEILING``, then the default. Invalid values fall back."""
+    if raw is None:
+        raw = os.environ.get("M8S_SESSION_CEILING")
+    try:
+        ceiling = int(raw) if raw is not None else HOST_SESSION_CEILING_DEFAULT
+    except (TypeError, ValueError):
+        return HOST_SESSION_CEILING_DEFAULT
+    return max(1, ceiling)
+
+
+def capacity_warn_at(ceiling: int, raw: Any = None) -> int:
+    """Pre-ceiling alert threshold for ``ceiling`` loaded sessions. Explicit
+    ``raw`` wins, then ``M8S_SESSION_WARN_AT``, then the warn fraction of
+    the ceiling. Clamped to ``1..ceiling``; invalid values fall back."""
+    if raw is None:
+        raw = os.environ.get("M8S_SESSION_WARN_AT")
+    try:
+        warn_at = int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        warn_at = None
+    if warn_at is None:
+        import math
+
+        warn_at = max(1, math.ceil(ceiling * HOST_SESSION_WARN_FRACTION))
+    return max(1, min(int(ceiling), warn_at))
+
+
+def capacity_loaded_from_claims(
+    claims: dict[str, dict[str, Any]] | None,
+) -> int:
+    """Daemonless loaded-session proxy: live P4 leases with a session id.
+
+    ``board plan``/``reconcile`` run without the controller socket, so the
+    true roster count is unreachable; each live lease holds a session, which
+    makes this a conservative floor. Pass ``--loaded`` for the true count.
+    """
+    count = 0
+    for claim in (claims or {}).values():
+        if isinstance(claim, dict) and claim.get("live", True) and claim.get("sessionId"):
+            count += 1
+    return count
+
+
+def capacity_posture(
+    loaded: int,
+    ceiling: int | None = None,
+    warn_at: int | None = None,
+) -> dict[str, Any]:
+    """Admission posture from loaded sessions vs ceiling (pure function).
+
+    ``open`` (below the warn threshold): propose freely. ``limited`` (warn
+    threshold reached, ceiling not): admit at most one new lane per pass —
+    supervisors should already be shedding load. ``closed`` (at/above the
+    ceiling): refuse every new lane until a slot frees. Every posture cites
+    its numbers in ``evidence`` so a gated lane can say exactly why.
+    """
+    try:
+        loaded_count = max(0, int(loaded))
+    except (TypeError, ValueError):
+        raise BoardError("badCapacity", f"loaded session count must be an integer: {loaded!r}")
+    ceiling_count = session_ceiling(ceiling)
+    warn_count = capacity_warn_at(ceiling_count, warn_at)
+    if loaded_count >= ceiling_count:
+        posture = "closed"
+    elif loaded_count >= warn_count:
+        posture = "limited"
+    else:
+        posture = "open"
+    return {
+        "loaded": loaded_count,
+        "ceiling": ceiling_count,
+        "warnAt": warn_count,
+        "posture": posture,
+        "evidence": (
+            f"{loaded_count} loaded session(s) vs ceiling {ceiling_count} "
+            f"(warn at {warn_count}): admission {posture}"
+        ),
+    }
+
+
+def unload_standby_seconds(raw: Any = None) -> int:
+    """Unload standby window. Explicit ``raw`` wins, then
+    ``M8S_UNLOAD_STANDBY_SECONDS``, then the default. Invalid falls back."""
+    if raw is None:
+        raw = os.environ.get("M8S_UNLOAD_STANDBY_SECONDS")
+    try:
+        seconds = int(raw) if raw is not None else UNLOAD_STANDBY_SECONDS
+    except (TypeError, ValueError):
+        return UNLOAD_STANDBY_SECONDS
+    return max(1, seconds)
+
+
 class BoardError(ValueError):
     """Typed board-compiler error. ``kind`` is machine-readable."""
 
@@ -1553,14 +1668,62 @@ def apply_collisions(
     return specs
 
 
+def apply_capacity_gate(
+    specs: list[dict[str, Any]],
+    capacity: dict[str, Any],
+    live_claims: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Load-based dispatch gate over ranked specs (pure function, issue #19).
+
+    Past the gate no new lane proposes: under a ``closed`` posture every
+    ``scheduled`` spec parks as ``queued``; under ``limited`` only the
+    top-ranked scheduled spec keeps its slot and the rest park. Parked
+    specs cite the capacity evidence in ``queuedBehind`` (loaded vs ceiling
+    with the posture) and carry ``gatedByCapacity``, so the refusal always
+    says why and what frees it. The gate stops *new* admissions only: a
+    spec already holding its branch lease stays scheduled (reconcile still
+    maps it to ``in-sync``). Collision-queued and decision-blocked specs
+    pass through untouched.
+    """
+    posture = capacity.get("posture", "open")
+    if posture == "open":
+        return specs
+    claims = live_claims or {}
+    admitted = 0
+    for spec in specs:
+        if spec.get("status") != "scheduled":
+            continue
+        lease = claims.get(spec.get("branch", "")) or {}
+        if lease.get("live") and lease.get("lane") == spec.get("lane"):
+            continue
+        if posture == "limited" and admitted == 0:
+            admitted += 1
+            continue
+        spec["status"] = "queued"
+        spec["gatedByCapacity"] = True
+        spec["queuedBehind"] = (
+            f"capacity gate ({posture}): {capacity.get('evidence')}; "
+            "parked until a slot frees — unload idle lanes per docs/capacity.md"
+        )
+    return specs
+
+
 def plan_board(
     board: dict[str, Any],
     live_claims: dict[str, dict[str, Any]] | None = None,
     now: float | None = None,
+    loaded: int | None = None,
+    ceiling: int | None = None,
+    warn_at: int | None = None,
 ) -> dict[str, Any]:
-    """Full planning pass: compile, then collide. ``live_claims`` defaults
-    to the real P4 lease table (reuse, not a parallel ownership system);
-    pass an explicit table (or {}) in tests and dry runs."""
+    """Full planning pass: compile, collide, then gate on host capacity.
+
+    ``live_claims`` defaults to the real P4 lease table (reuse, not a
+    parallel ownership system); pass an explicit table (or {}) in tests and
+    dry runs. ``loaded`` defaults to the live-lease count (a conservative
+    daemonless floor — pass the true roster count via ``--loaded``);
+    ``ceiling``/``warn_at`` default to the host policy with env overrides.
+    """
     at = time.time() if now is None else now
     compiled = compile_board(board, at)
     if live_claims is None:
@@ -1569,6 +1732,11 @@ def plan_board(
         except (OSError, ValueError):
             live_claims = {}
     compiled["specs"] = apply_collisions(compiled["specs"], live_claims)
+    if loaded is None:
+        loaded = capacity_loaded_from_claims(live_claims)
+    capacity = capacity_posture(loaded, ceiling, warn_at)
+    compiled["specs"] = apply_capacity_gate(compiled["specs"], capacity, live_claims)
+    compiled["capacity"] = capacity
     return compiled
 
 
@@ -1681,6 +1849,9 @@ def board_reconcile(
     live_claims: dict[str, dict[str, Any]] | None = None,
     recent_events: list[dict[str, Any]] | None = None,
     now: float | None = None,
+    loaded: int | None = None,
+    ceiling: int | None = None,
+    warn_at: int | None = None,
 ) -> dict[str, Any]:
     """Drive actual lane state toward the planned desired state (pure core).
 
@@ -1688,14 +1859,15 @@ def board_reconcile(
     (the same state ``list``/``events`` show: stuck lanes, spend breaches,
     expired leases). Emits one action per spec — ``propose`` (free to
     schedule: operator runs ``bus claim`` + ``launch``), ``in-sync``
-    (already leased), ``queued`` (collision), ``page-human``
-    (decision-blocked) — plus ``requeue`` entries for expired leases on
-    desired branches and an ``attention`` list for stuck/over-budget
-    signals. Reconcile never claims, launches, or guesses: it proposes
-    and pages.
+    (already leased), ``queued`` (collision or capacity gate),
+    ``page-human`` (decision-blocked) — plus ``requeue`` entries for
+    expired leases on desired branches and an ``attention`` list for
+    stuck/over-budget signals. Past the capacity gate no new lane
+    proposes: gated specs queue with the loaded-vs-ceiling evidence cited.
+    Reconcile never claims, launches, or guesses: it proposes and pages.
     """
     at = time.time() if now is None else now
-    plan = plan_board(board, live_claims, at)
+    plan = plan_board(board, live_claims, at, loaded, ceiling, warn_at)
     claims = live_claims if live_claims is not None else {}
     actions: list[dict[str, Any]] = []
     for spec in plan["specs"]:
@@ -1796,7 +1968,14 @@ def board_main(args: Any) -> dict[str, Any]:
         if not args.board:
             raise SystemExit("board plan requires --board FILE")
         board = load_board_snapshot(args.board)
-        return {"plan": plan_board(board)}
+        return {
+            "plan": plan_board(
+                board,
+                loaded=getattr(args, "loaded", None),
+                ceiling=getattr(args, "ceiling", None),
+                warn_at=getattr(args, "warn_at", None),
+            )
+        }
     if action == "reconcile":
         if not args.board:
             raise SystemExit("board reconcile requires --board FILE")
@@ -1809,7 +1988,33 @@ def board_main(args: Any) -> dict[str, Any]:
             events = read_events(0, args.events_limit)
         except (OSError, ValueError):
             events = []
-        plan = board_reconcile(board, claims, events)
+        plan = board_reconcile(
+            board,
+            claims,
+            events,
+            loaded=getattr(args, "loaded", None),
+            ceiling=getattr(args, "ceiling", None),
+            warn_at=getattr(args, "warn_at", None),
+        )
+        capacity = plan.get("capacity", {})
+        if capacity.get("loaded", 0) >= capacity.get("warnAt", 0) and capacity.get("warnAt"):
+            # Pre-ceiling alert (issue #19): a signal, not a rejection —
+            # it fires at/above the warn threshold, i.e. below the point
+            # where the gate starts refusing new lanes.
+            emit_local(
+                {
+                    "kind": CAPACITY_WARNING_KIND,
+                    "loaded": capacity.get("loaded"),
+                    "ceiling": capacity.get("ceiling"),
+                    "warnAt": capacity.get("warnAt"),
+                    "posture": capacity.get("posture"),
+                    "summary": (
+                        f"host load {capacity.get('loaded')}/{capacity.get('ceiling')} "
+                        f"(warn at {capacity.get('warnAt')}, admission "
+                        f"{capacity.get('posture')}): shed load before launches fail"
+                    ),
+                }
+            )
         for item in plan["actions"]:
             if item["action"] == "page-human":
                 emit_local(
@@ -1857,10 +2062,13 @@ class RetireError(ValueError):
 
     ``kind`` is machine-readable: "sessionNotFound" (unknown alias/id, or
     already retired), "sessionRetired" (new work addressed to a retired
-    session), "sessionBusy" (pending approvals/inputs or a dead turn
-    awaiting owner action), "uncommittedWork" (dirty worktree), "openPR"
-    (an open PR on the lane branch). Busy/dirty/PR refusals lift with the
-    explicit supervisor override (``retire --force``).
+    session), "sessionBusy" (pending approvals/inputs, a dead turn
+    awaiting owner action, or — unload only — a live turn), "uncommittedWork"
+    (dirty worktree), "openPR" (an open PR on the lane branch), "standby"
+    (unload only: transcript activity inside the review/CI standby window,
+    or no activity signal yet). Retire's busy/dirty/PR refusals lift with
+    the explicit supervisor override (``retire --force``); unload has no
+    override — guarded lanes never unload.
     """
 
     def __init__(self, kind: str, message: str) -> None:
@@ -2152,6 +2360,7 @@ class MspHost:
             elif method == "turn/completed":
                 terminal = params.get("terminal")
                 state["lastTerminal"] = terminal
+                state.pop("activeTurn", None)
                 if terminal in ("failed", "cancelled"):
                     state["needsOwnerAction"] = True
                     self.record(
@@ -2252,6 +2461,12 @@ class MspHost:
             params["reasoningEffort"] = reasoning
         result = await self.call("turn/start", params)
         self.owner_acted(session_id)
+        state = self.sessions.get(session_id)
+        if state is not None:
+            # A turn is now live on this lane. Unload refuses while the
+            # marker stands (uncertain external effects); turn/completed —
+            # or an explicit turn cancel/unqueue — clears it.
+            state["activeTurn"] = result.get("turnId") or params["commandId"]
         self.record({"kind": "turn.submitted", "sessionId": session_id, "turnId": result.get("turnId")})
         return result
 
@@ -2265,19 +2480,16 @@ class MspHost:
         state.pop("lastTerminal", None)
         state.pop("stuckFlagged", None)
 
-    async def retire(self, reference: str, force: bool = False) -> dict[str, Any]:
-        """End a served session whose duty is complete (issue #21).
+    async def _departure_checks(self, reference: str) -> dict[str, Any]:
+        """Shared guard assessment for retire/unload (issues #21/#19).
 
-        Confirms the session is idle (no pending approvals/inputs, no dead
-        turn awaiting owner action), then refuses sessions with uncommitted
-        work or an open PR unless ``force`` carries the explicit supervisor
-        override. On success the session leaves the roster, its alias and
-        budget slots free up, its branch lease (if any) is released, and
-        its id persists in the retired set so restarts never resurrect it
-        into the roster, health, or stuck accounting.
-
-        Raises RetireError ("sessionNotFound" / "sessionBusy" /
-        "uncommittedWork" / "openPR").
+        One code path judges both departures — retire and unload reuse
+        these guards instead of duplicating them. Returns the report
+        (session id, state, pending counts, worktree signals); ``blocking``
+        lists ``(kind, message)`` refusals in check order — idle/busy
+        first, then uncommitted work, then open PR — and empty means the
+        shared guards are clear. Raises RetireError("sessionNotFound")
+        for unknown or already-retired references.
         """
         session_id = self.resolve(reference)
         state = self.sessions.get(session_id)
@@ -2290,30 +2502,66 @@ class MspHost:
         except Exception:
             pending_result = {}
         counts = pending_counts(pending_result, state.get("attention"))
-        if (counts["approvals"] + counts["inputs"] > 0 or state.get("needsOwnerAction")) and not force:
-            raise RetireError(
-                "sessionBusy",
-                f"session {reference!r} is not idle "
-                f"(approvals={counts['approvals']}, inputs={counts['inputs']}, "
-                f"needsOwnerAction={bool(state.get('needsOwnerAction'))}); "
-                "stand it down first or retire with --force",
+        blocking: list[tuple[str, str]] = []
+        if counts["approvals"] + counts["inputs"] > 0 or state.get("needsOwnerAction"):
+            blocking.append(
+                (
+                    "sessionBusy",
+                    f"session {reference!r} is not idle "
+                    f"(approvals={counts['approvals']}, inputs={counts['inputs']}, "
+                    f"needsOwnerAction={bool(state.get('needsOwnerAction'))}); "
+                    "stand it down first or retire with --force",
+                )
             )
         workspace = state.get("workspace")
         dirty = worktree_dirty(workspace) if workspace else None
-        if dirty and not force:
-            raise RetireError(
-                "uncommittedWork",
-                f"session {reference!r} has uncommitted work in {workspace}; "
-                "land it first or retire with --force",
+        if dirty:
+            blocking.append(
+                (
+                    "uncommittedWork",
+                    f"session {reference!r} has uncommitted work in {workspace}; "
+                    "land it first or retire with --force",
+                )
             )
         branch = health_progress_for_workspace(workspace).get("branch") if workspace else None
         pr = health_pr_for_branch(branch, workspace) if branch else None
-        if pr is not None and not force:
-            raise RetireError(
-                "openPR",
-                f"session {reference!r} has an open PR on {branch} "
-                f"(PR #{pr.get('number')}); merge or close it first or retire with --force",
+        if pr is not None:
+            blocking.append(
+                (
+                    "openPR",
+                    f"session {reference!r} has an open PR on {branch} "
+                    f"(PR #{pr.get('number')}); merge or close it first or retire with --force",
+                )
             )
+        return {
+            "session_id": session_id,
+            "state": state,
+            "counts": counts,
+            "workspace": workspace,
+            "dirty": dirty,
+            "branch": branch,
+            "pr": pr,
+            "blocking": blocking,
+        }
+
+    def _drop_departed(
+        self,
+        session_id: str,
+        state: dict[str, Any],
+        *,
+        forced: bool,
+        event_kind: str,
+        summary: str,
+        event_extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Shared departure removal for retire/unload (issues #21/#19).
+
+        Releases the lane's branch lease (if any), drops the session from
+        the roster/aliases/budgets, persists the id in the retired set so
+        restarts never resurrect it, and records the departure event. The
+        caller supplies the event kind/summary/attribution — the removal
+        itself is one code path.
+        """
         released: dict[str, Any] | None = None
         try:
             for leased_branch, claim in load_claims().items():
@@ -2337,34 +2585,142 @@ class MspHost:
         retired[session_id] = {
             "alias": alias,
             "retiredAt": time.time(),
-            "forced": bool(force),
+            "forced": bool(forced),
         }
         self.retired = retired
         save_retired(retired)
         self.record(
             {
-                "kind": "lane.retired",
+                "kind": event_kind,
                 "sessionId": session_id,
                 "alias": alias,
-                "forced": bool(force),
+                "forced": bool(forced),
                 "releasedClaim": released,
-                "summary": f"lane {alias or session_id} retired"
-                + (" (forced)" if force else ""),
+                "summary": summary,
+                **(event_extra or {}),
             }
         )
+        return {"sessionId": session_id, "alias": alias, "releasedClaim": released}
+
+    async def retire(self, reference: str, force: bool = False) -> dict[str, Any]:
+        """End a served session whose duty is complete (issue #21).
+
+        Judges the shared departure guards (idle: no pending
+        approvals/inputs, no dead turn awaiting owner action; clean
+        worktree; no open PR), refusing with a typed RetireError unless
+        ``force`` carries the explicit supervisor override. On success the
+        session leaves the roster, its alias and budget slots free up, its
+        branch lease (if any) is released, and its id persists in the
+        retired set so restarts never resurrect it into the roster, health,
+        or stuck accounting.
+
+        Raises RetireError ("sessionNotFound" / "sessionBusy" /
+        "uncommittedWork" / "openPR").
+        """
+        checks = await self._departure_checks(reference)
+        session_id = checks["session_id"]
+        state = checks["state"]
+        if checks["blocking"] and not force:
+            kind, message = checks["blocking"][0]
+            raise RetireError(kind, message)
+        alias = state.get("alias")
+        dropped = self._drop_departed(
+            session_id,
+            state,
+            forced=force,
+            event_kind="lane.retired",
+            summary=f"lane {alias or session_id} retired" + (" (forced)" if force else ""),
+        )
         return {
-            "sessionId": session_id,
-            "alias": alias,
+            **dropped,
             "forced": bool(force),
-            "idle": counts,
+            "idle": checks["counts"],
             "worktree": {
-                "workspace": workspace,
-                "dirty": dirty,
-                "branch": branch,
-                "pr": pr,
+                "workspace": checks["workspace"],
+                "dirty": checks["dirty"],
+                "branch": checks["branch"],
+                "pr": checks["pr"],
             },
-            "releasedClaim": released,
             "retired": True,
+        }
+
+    async def unload(
+        self, reference: str, reason: str = "capacity", by: str | None = None
+    ) -> dict[str, Any]:
+        """Unload an idle owned session to free host capacity (issue #19).
+
+        The capacity-attributed departure path: judges the shared retire
+        guards with NO override — lanes with uncommitted work, pending
+        approvals/inputs, a dead turn awaiting owner action, or an open PR
+        never unload — then refuses lanes with a live turn, or with
+        transcript activity inside the standby window (review/CI follow-up;
+        any serve notification, including child-activity relays, refreshes
+        activity and re-arms standby). On success the session leaves the
+        roster exactly like a retire, and a ``lane.unloaded`` event records
+        who ordered it, why, and the roster count before/after — explicit
+        and attributable, never unattended deletion.
+
+        Raises RetireError ("sessionNotFound" / "sessionBusy" /
+        "uncommittedWork" / "openPR" / "standby").
+        """
+        checks = await self._departure_checks(reference)
+        if checks["blocking"]:
+            kind, message = checks["blocking"][0]
+            raise RetireError(kind, message)
+        session_id = checks["session_id"]
+        state = checks["state"]
+        live_turn = state.get("activeTurn")
+        if live_turn:
+            raise RetireError(
+                "sessionBusy",
+                f"session {reference!r} has a live turn ({live_turn}); "
+                "wait for turn/completed (or cancel it) before unloading",
+            )
+        standby = unload_standby_seconds()
+        last = state.get("lastActivity")
+        if not isinstance(last, (int, float)):
+            raise RetireError(
+                "standby",
+                f"session {reference!r} has no activity signal yet; "
+                "cannot prove the standby window — observe it first",
+            )
+        idle_for = time.time() - last
+        if idle_for < standby:
+            raise RetireError(
+                "standby",
+                f"session {reference!r} idle {idle_for:.0f}s "
+                f"is inside the {standby}s standby window for review/CI "
+                "follow-up; unload after it goes quiet",
+            )
+        operator = by or agent_id()
+        loaded_before = len(self.sessions)
+        alias = state.get("alias")
+        dropped = self._drop_departed(
+            session_id,
+            state,
+            forced=False,
+            event_kind="lane.unloaded",
+            summary=f"lane {alias or session_id} unloaded by {operator} ({reason})",
+            event_extra={
+                "by": operator,
+                "reason": reason,
+                "loadedBefore": loaded_before,
+                "loadedAfter": loaded_before - 1,
+            },
+        )
+        return {
+            **dropped,
+            "forced": False,
+            "by": operator,
+            "reason": reason,
+            "idle": checks["counts"],
+            "worktree": {
+                "workspace": checks["workspace"],
+                "dirty": checks["dirty"],
+                "branch": checks["branch"],
+                "pr": checks["pr"],
+            },
+            "unloaded": True,
         }
 
     async def list_sessions(self) -> dict[str, Any]:
@@ -2571,6 +2927,10 @@ class MspHost:
         result = await self.call(method, merged)
         if session_id:
             self.owner_acted(session_id)
+            if method in ("turn/cancel", "turn/unqueue"):
+                ended = self.sessions.get(session_id)
+                if ended is not None:
+                    ended.pop("activeTurn", None)
         self.record({"kind": "controller.call", "method": method, "sessionId": merged.get("sessionId")})
         return result
 
@@ -3048,6 +3408,12 @@ async def dispatch(host: MspHost, request: dict[str, Any]) -> Any:
         return await host.submit(request["session"], request["prompt"], request.get("reasoningEffort"))
     if command == "retire":
         return await host.retire(request["session"], force=bool(request.get("force")))
+    if command == "unload":
+        return await host.unload(
+            request["session"],
+            reason=str(request.get("reason") or "capacity"),
+            by=request.get("by"),
+        )
     if command == "list":
         result = await host.list_sessions()
         # P4: lease state rides along — the full claim table plus the live
@@ -4693,6 +5059,22 @@ def parser() -> argparse.ArgumentParser:
         help="explicit supervisor override: retire a busy session or one with "
         "uncommitted work / an open PR",
     )
+    unload = sub.add_parser(
+        "unload",
+        help="unload an idle owned session to free host capacity "
+        "(no override: guarded lanes never unload)",
+    )
+    unload.add_argument("session", help="session alias or id to unload")
+    unload.add_argument(
+        "--reason",
+        default="capacity",
+        help="attributed reason recorded on the lane.unloaded event (default: capacity)",
+    )
+    unload.add_argument(
+        "--by",
+        default=None,
+        help="attributed operator recorded on the event (default: this agent)",
+    )
     sub.add_parser("inbox", help="pending approvals and user input across all owned sessions")
     health_cmd = sub.add_parser(
         "health", help="fused swarm health screen: liveness, turns, progress, down/stuck/blocked"
@@ -4755,6 +5137,27 @@ def parser() -> argparse.ArgumentParser:
     )
     board_cmd.add_argument("--repo", help="OWNER/REPO for board export")
     board_cmd.add_argument("--board", help="board snapshot JSON file (plan/reconcile)")
+    board_cmd.add_argument(
+        "--loaded",
+        type=int,
+        default=None,
+        help="loaded owned sessions for the capacity gate (plan/reconcile; "
+        "default: live P4 lease count; see docs/capacity.md)",
+    )
+    board_cmd.add_argument(
+        "--ceiling",
+        type=int,
+        default=None,
+        help="owned-session ceiling for the capacity gate (plan/reconcile; "
+        "default: host policy / M8S_SESSION_CEILING)",
+    )
+    board_cmd.add_argument(
+        "--warn-at",
+        type=int,
+        default=None,
+        help="pre-ceiling alert threshold (plan/reconcile; default: host policy "
+        "/ M8S_SESSION_WARN_AT)",
+    )
     board_cmd.add_argument("--out", help="write exported snapshot here (export)")
     board_cmd.add_argument("--limit", type=int, default=100, help="issues to export (export)")
     board_cmd.add_argument(
@@ -4927,6 +5330,13 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
         return {"command": "pending", "session": args.session}
     if command == "retire":
         return {"command": "retire", "session": args.session, "force": args.force}
+    if command == "unload":
+        return {
+            "command": "unload",
+            "session": args.session,
+            "reason": args.reason,
+            "by": args.by,
+        }
     if command == "inbox":
         return {"command": "inbox"}
     if command == "health":
