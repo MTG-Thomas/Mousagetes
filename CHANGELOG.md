@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.2.0
+
+- Per-lane budgets (`budget` command, `launch --max-tokens/--max-context-tokens/--models`):
+  visible in `list`, enforced (over-budget lanes refuse new turns, disallowed
+  models refused), breaches recorded as `budget.exceeded` with
+  `decisionClass: spend`.
+- Stuck-lane detection: idle past `M8S_STUCK_AFTER_SECONDS` (default 30 min,
+  transcript + worktree activity) or failed/cancelled turns with no owner
+  action surface as `stuck` in `list` plus `lane.stuck` / `lane.attention` events.
+- Validated `call` passthrough: unknown MSP methods and missing-but-required
+  `commandId` fail client-side with a typed `errorKind`, no daemon round-trip.
+
 ## v0.1.0
 
 - Initial public release (AGPL-3.0-or-later).

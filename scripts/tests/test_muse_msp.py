@@ -30,13 +30,14 @@ def parse(argv: list[str]):
     return muse_msp.parser().parse_args(argv)
 
 
-class FakeHost:
+class FakeHost(muse_msp.MspHost):
     def __init__(self) -> None:
+        # Deliberately no super().__init__: no daemon state, no budget file read.
         self.calls: list[tuple[str, dict]] = []
         self.aliases = {"lane": "session-1"}
-
-    def resolve(self, reference: str) -> str:
-        return self.aliases.get(reference, reference)
+        self.sessions: dict[str, dict] = {}
+        self.budgets: dict[str, dict] = {}
+        self.watchers = set()
 
     def record(self, record: dict) -> None:
         pass
@@ -44,10 +45,6 @@ class FakeHost:
     async def call(self, method: str, params: dict | None = None):
         self.calls.append((method, dict(params or {})))
         return {"ok": True}
-
-    async def supervised_call(self, method: str, params: dict | None = None, command_id: str = "auto"):
-        # Reuse the real implementation; it only needs call() and record().
-        return await muse_msp.MspHost.supervised_call(self, method, params, command_id)  # type: ignore[arg-type]
 
 
 class BuildRequestTest(unittest.TestCase):
