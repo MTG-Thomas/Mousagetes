@@ -119,6 +119,15 @@ Give agents concrete ownership boundaries and an observable stopping condition. 
 
 Tailor instructions to existing ownership. Do not tell several sessions to "pick an issue" without a claim protocol.
 
+The controller owns a claim/heartbeat/intent bus for that protocol
+(`scripts/muse-msp.py bus ...`, see `docs/bus.md`): claim the branch
+before editing (`bus claim --host H --lane X --branch lane/x --checkout
+/path`), keep the lease alive with heartbeats (`bus heartbeat --host H`
+— the `host heartbeat` action also re-gossips leases automatically),
+publish intentions (`bus intent --verb propose-plan --branch lane/x`),
+and check `bus list` for live/requeue lease state. One lane per branch,
+one writer per checkout; expired leases requeue for reassignment.
+
 ## Supervision loop
 
 Use a recurring goal or monitor when the product provides one. Otherwise poll at a proportionate interval while work remains. Avoid tight loops.

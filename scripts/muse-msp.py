@@ -148,7 +148,7 @@ COMMAND_METHODS = frozenset(
 )
 
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 
 def uuid7() -> str:
@@ -672,6 +672,428 @@ def pick_host(
     return ranked[0]
 
 
+# ---------------------------------------------------------------------------
+# Moonshot P4: claim / heartbeat / intent bus between cooperative nodes.
+#
+# Transport choice: a NATS-subject-shaped file-backed local bus. Every bus
+# record is {"subject", "message"} appended to bus.ndjson in the daemon
+# runtime dir (the same pattern as hosts.json/budgets.json/events.ndjson),
+# and the lease table lives in claims.json keyed by branch. Agent-to-agent
+# gossip reuses the P3 SSH peer CLI (`peer_cli_argv`): a node runs
+# `bus read` locally and replays it at the peer — no new carrier, no TCP
+# listener (MSP stays stdio-only), stdlib only. Git-as-mailbox was
+# considered and rejected: leases need second-granularity expiry and cheap
+# heartbeats, and a commit/push per heartbeat would spam history and need
+# the network. Graduation path: replace publish()/read_bus() with NATS
+# publish/subscribe on the same subjects — every message already carries
+# type+version, so that is a transport change, not a redesign.
+# ---------------------------------------------------------------------------
+
+BUS_SUBJECTS = ("m8s.claims", "m8s.heartbeat", "m8s.intent")
+
+# Protocol version for every message type. A future v2 is a deliberate
+# upgrade: validate_bus_message() rejects unknown versions outright.
+BUS_PROTOCOL_VERSION = 1
+
+CLAIM_MESSAGE_TYPE = "m8s.claim"
+HEARTBEAT_MESSAGE_TYPE = "m8s.heartbeat"
+INTENT_MESSAGE_TYPE = "m8s.intent"
+
+SUBJECT_MESSAGE_TYPE = {
+    "m8s.claims": CLAIM_MESSAGE_TYPE,
+    "m8s.heartbeat": HEARTBEAT_MESSAGE_TYPE,
+    "m8s.intent": INTENT_MESSAGE_TYPE,
+}
+
+CLAIMS_FILE = RUNTIME / "claims.json"
+BUS_LOG = RUNTIME / "bus.ndjson"
+
+# Branch-lease TTL. Overridable via M8S_LEASE_TTL_SECONDS; invalid values
+# fall back to the default.
+LEASE_TTL_SECONDS = 300
+
+
+def lease_ttl_seconds() -> int:
+    try:
+        return max(1, int(os.environ.get("M8S_LEASE_TTL_SECONDS", LEASE_TTL_SECONDS)))
+    except (TypeError, ValueError):
+        return LEASE_TTL_SECONDS
+
+
+def local_host() -> str:
+    """Default claim/intent host: this machine's hostname."""
+    import socket
+
+    return socket.gethostname()
+
+
+class BusError(ValueError):
+    """Typed bus/lease error.
+
+    ``kind`` is machine-readable: "badSubject", "badMessage", "badVersion",
+    "leaseHeld", "checkoutBusy", "leaseNotFound", "notOwner".
+    """
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+def make_claim(
+    host: str,
+    lane: str,
+    branch: str,
+    checkout: str | None = None,
+    session_id: str | None = None,
+    ttl: int | None = None,
+    now: float | None = None,
+    claim_id: str | None = None,
+) -> dict[str, Any]:
+    """Build a versioned ownership claim ("host B holds lane X on branch Y").
+
+    Protocol-shaped and transport-independent: plain JSON with type+version
+    fields, publishable on subject ``m8s.claims`` via any carrier.
+    """
+    at = time.time() if now is None else now
+    ttl_s = lease_ttl_seconds() if ttl is None else ttl
+    claim: dict[str, Any] = {
+        "type": CLAIM_MESSAGE_TYPE,
+        "version": BUS_PROTOCOL_VERSION,
+        "claimId": claim_id or uuid7(),
+        "host": host,
+        "lane": lane,
+        "branch": branch,
+        "issuedAt": at,
+        "expiresAt": at + ttl_s,
+    }
+    if checkout is not None:
+        claim["checkout"] = checkout
+    if session_id is not None:
+        claim["sessionId"] = session_id
+    return claim
+
+
+def make_heartbeat(
+    host: str,
+    agent: str,
+    claims: list[dict[str, Any]],
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Build a versioned heartbeat re-gossiping this host's ownership claims.
+
+    Publishable on subject ``m8s.heartbeat``; the embedded claims are the
+    re-gossip (presence broadcast), not a second liveness feed — host
+    liveness itself still comes from the P3 registry heartbeat.
+    """
+    return {
+        "type": HEARTBEAT_MESSAGE_TYPE,
+        "version": BUS_PROTOCOL_VERSION,
+        "host": host,
+        "agentId": agent,
+        "at": time.time() if now is None else now,
+        "claims": claims,
+    }
+
+
+def make_intent(
+    host: str,
+    verb: str,
+    lane: str | None = None,
+    branch: str | None = None,
+    detail: str | None = None,
+    session_id: str | None = None,
+    ttl: int | None = None,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Build a versioned intent message, publishable on ``m8s.intent``."""
+    at = time.time() if now is None else now
+    ttl_s = lease_ttl_seconds() if ttl is None else ttl
+    intent: dict[str, Any] = {
+        "type": INTENT_MESSAGE_TYPE,
+        "version": BUS_PROTOCOL_VERSION,
+        "intentId": uuid7(),
+        "host": host,
+        "verb": verb,
+        "at": at,
+        "expiresAt": at + ttl_s,
+    }
+    if lane is not None:
+        intent["lane"] = lane
+    if branch is not None:
+        intent["branch"] = branch
+    if detail is not None:
+        intent["detail"] = detail
+    if session_id is not None:
+        intent["sessionId"] = session_id
+    return intent
+
+
+BUS_REQUIRED_FIELDS = {
+    "m8s.claims": ("claimId", "host", "lane", "branch", "issuedAt", "expiresAt"),
+    "m8s.heartbeat": ("host", "agentId", "at", "claims"),
+    "m8s.intent": ("intentId", "host", "verb", "at"),
+}
+
+
+def validate_bus_message(subject: str, message: Any) -> None:
+    """Validate a bus message against its subject's protocol shape.
+
+    Raises BusError ("badSubject" / "badMessage" / "badVersion"). Pure check:
+    performs no I/O.
+    """
+    if subject not in BUS_SUBJECTS:
+        raise BusError(
+            "badSubject",
+            f"unknown bus subject {subject!r}: want one of {list(BUS_SUBJECTS)}",
+        )
+    if not isinstance(message, dict):
+        raise BusError("badMessage", f"bus message on {subject} must be an object")
+    want = SUBJECT_MESSAGE_TYPE[subject]
+    if message.get("type") != want:
+        raise BusError(
+            "badMessage",
+            f"subject {subject} carries {want}, got {message.get('type')!r}",
+        )
+    if message.get("version") != BUS_PROTOCOL_VERSION:
+        raise BusError(
+            "badVersion",
+            f"unsupported {want} version {message.get('version')!r}: "
+            f"this bus speaks version {BUS_PROTOCOL_VERSION}",
+        )
+    missing = [key for key in BUS_REQUIRED_FIELDS[subject] if message.get(key) in (None, "")]
+    if missing:
+        raise BusError(
+            "badMessage", f"{want} message missing required fields: {missing}"
+        )
+
+
+def publish(subject: str, message: dict[str, Any]) -> dict[str, Any]:
+    """Append a validated message to the local bus log. Returns the message.
+
+    The transport primitive: graduating to NATS later means swapping this
+    append (and read_bus) for publish/subscribe on the same subjects —
+    message shapes do not change.
+    """
+    validate_bus_message(subject, message)
+    with BUS_LOG.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps({"subject": subject, "message": message}, separators=(",", ":"))
+            + "\n"
+        )
+    return message
+
+
+def read_bus(
+    subject: str | None = None, limit: int = 200, after: float = 0.0
+) -> list[dict[str, Any]]:
+    """Read bus records, optionally filtered by subject and message time."""
+    if subject is not None and subject not in BUS_SUBJECTS:
+        raise BusError(
+            "badSubject",
+            f"unknown bus subject {subject!r}: want one of {list(BUS_SUBJECTS)}",
+        )
+    if not BUS_LOG.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    with BUS_LOG.open(encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if subject is not None and record.get("subject") != subject:
+                continue
+            message = record.get("message") or {}
+            stamp = message.get("issuedAt", message.get("at", 0))
+            if isinstance(stamp, (int, float)) and stamp > after:
+                records.append(record)
+    return records[-limit:]
+
+
+def load_claims() -> dict[str, dict[str, Any]]:
+    try:
+        raw = json.loads(CLAIMS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def save_claims(claims: dict[str, dict[str, Any]]) -> None:
+    CLAIMS_FILE.write_text(json.dumps(claims, sort_keys=True), encoding="utf-8")
+
+
+def claim_live(
+    claim: dict[str, Any], now: float, hosts: dict[str, dict[str, Any]] | None = None
+) -> bool:
+    """A branch lease is live while unexpired — and while its host is live.
+
+    Host liveness reuses the P3 registry feed: a claim whose enrolled host
+    reads dead is treated as expired (reassignable), so a crashed owner
+    cannot squat a branch past its heartbeat. Claims from hosts unknown to
+    the registry fall back to wall-clock expiry alone.
+    """
+    expires = claim.get("expiresAt")
+    if not isinstance(expires, (int, float)) or now >= expires:
+        return False
+    if hosts is None:
+        return True
+    record = hosts.get(claim.get("host", ""))
+    if record is None:
+        return True
+    return host_alive(record, now, host_ttl_seconds())
+
+
+def claim_branch(
+    host: str,
+    lane: str,
+    branch: str,
+    checkout: str | None = None,
+    session_id: str | None = None,
+    ttl: int | None = None,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Acquire (or refresh) a branch-level lease: one lane per branch, one
+    writer per checkout.
+
+    Re-claiming your own (host, lane, branch) refreshes the lease (this is
+    the heartbeat path). A live foreign lease on the branch raises
+    BusError("leaseHeld"); a live foreign lease on the checkout raises
+    BusError("checkoutBusy"). Expired (or dead-host) leases are
+    reassigned — requeue on expiry. Publishes the claim on ``m8s.claims``.
+    """
+    if not host or not lane or not branch:
+        raise BusError("badMessage", "claim requires non-empty host, lane, and branch")
+    if ttl is not None and (
+        isinstance(ttl, bool) or not isinstance(ttl, int) or ttl < 1
+    ):
+        raise BusError("badMessage", f"claim ttl must be a positive integer: {ttl!r}")
+    at = time.time() if now is None else now
+    claims = load_claims()
+    hosts = load_hosts()
+    for other_branch, existing in claims.items():
+        if not claim_live(existing, at, hosts):
+            continue
+        if other_branch == branch and (existing.get("host"), existing.get("lane")) != (
+            host,
+            lane,
+        ):
+            raise BusError(
+                "leaseHeld",
+                f"branch {branch!r} held by {existing.get('host')}/{existing.get('lane')} "
+                f"until {existing.get('expiresAt')}",
+            )
+        if (
+            checkout
+            and existing.get("checkout")
+            and existing["checkout"] == checkout
+            and (existing.get("host"), existing.get("lane")) != (host, lane)
+        ):
+            raise BusError(
+                "checkoutBusy",
+                f"checkout {checkout!r} has its writer: "
+                f"{existing.get('host')}/{existing.get('lane')} on {other_branch!r}",
+            )
+    previous = claims.get(branch)
+    keep_id = (
+        previous.get("claimId")
+        if previous and (previous.get("host"), previous.get("lane")) == (host, lane)
+        else None
+    )
+    claim = make_claim(host, lane, branch, checkout, session_id, ttl, at, keep_id)
+    claims[branch] = claim
+    save_claims(claims)
+    publish("m8s.claims", claim)
+    return claim
+
+
+def refresh_claims(
+    host: str, now: float | None = None, ttl: int | None = None
+) -> list[dict[str, Any]]:
+    """Heartbeat for one host's leases: extend expiry and re-gossip each
+    claim on ``m8s.claims``. Returns the refreshed claims (empty when the
+    host holds none — a heartbeat that gossips nothing publishes nothing).
+    """
+    at = time.time() if now is None else now
+    ttl_s = lease_ttl_seconds() if ttl is None else ttl
+    claims = load_claims()
+    refreshed: list[dict[str, Any]] = []
+    for branch, claim in claims.items():
+        if claim.get("host") != host:
+            continue
+        claim["expiresAt"] = at + ttl_s
+        refreshed.append(claim)
+    if refreshed:
+        save_claims(claims)
+        for claim in refreshed:
+            publish("m8s.claims", claim)
+    return refreshed
+
+
+def release_claim(branch: str, host: str | None = None) -> dict[str, Any]:
+    """Release a branch lease. With ``host`` given, only that host's claim
+    may be released (BusError "notOwner" otherwise); unknown branches raise
+    BusError("leaseNotFound")."""
+    claims = load_claims()
+    claim = claims.get(branch)
+    if claim is None:
+        raise BusError("leaseNotFound", f"no claim on branch {branch!r}")
+    if host is not None and claim.get("host") != host:
+        raise BusError(
+            "notOwner",
+            f"branch {branch!r} is claimed by {claim.get('host')!r}, not {host!r}",
+        )
+    del claims[branch]
+    save_claims(claims)
+    return claim
+
+
+def sweep_claims(
+    now: float | None = None, hosts: dict[str, dict[str, Any]] | None = None
+) -> list[dict[str, Any]]:
+    """Report newly-expired leases (requeue on expiry) exactly once each.
+
+    Returns the expired claims not previously announced and stamps them so
+    the next sweep stays quiet; callers record the ``claim.expired`` events.
+    Expired claims stay in the table (visible requeue state) until released
+    or reassigned.
+    """
+    at = time.time() if now is None else now
+    if hosts is None:
+        hosts = load_hosts()
+    claims = load_claims()
+    newly: list[dict[str, Any]] = []
+    changed = False
+    for claim in claims.values():
+        if not claim_live(claim, at, hosts) and not claim.get("expiryAnnounced"):
+            claim["expiryAnnounced"] = True
+            newly.append(claim)
+            changed = True
+    if changed:
+        save_claims(claims)
+    return newly
+
+
+def claim_table(
+    now: float | None = None, hosts: dict[str, dict[str, Any]] | None = None
+) -> dict[str, dict[str, Any]]:
+    """Lease table: every claim annotated with live/requeue lease state."""
+    at = time.time() if now is None else now
+    if hosts is None:
+        try:
+            hosts = load_hosts()
+        except (OSError, ValueError):
+            hosts = {}
+    table: dict[str, dict[str, Any]] = {}
+    try:
+        claims = load_claims()
+    except (OSError, ValueError):
+        claims = {}
+    for branch, claim in claims.items():
+        live = claim_live(claim, at, hosts)
+        table[branch] = {**claim, "live": live, "requeue": not live}
+    return table
+
+
 class CallValidationError(ValueError):
     """Typed client-side error for the generic `call` passthrough.
 
@@ -770,7 +1192,7 @@ class MspHost:
                 "clientInfo": {
                     "name": "codex_muse_supervisor",
                     "title": "Codex Muse supervisor",
-                    "version": "0.3.0",
+                    "version": "0.4.0",
                 },
                 "capabilities": {
                     "experimentalApi": True,
@@ -1215,7 +1637,27 @@ async def dispatch(host: MspHost, request: dict[str, Any]) -> Any:
     if command == "send":
         return await host.submit(request["session"], request["prompt"], request.get("reasoningEffort"))
     if command == "list":
-        return await host.list_sessions()
+        result = await host.list_sessions()
+        # P4: lease state rides along — the full claim table plus the live
+        # lease (if any) on each owned session.
+        table = claim_table()
+        result["claims"] = table
+        live_by_session = {
+            claim.get("sessionId"): claim
+            for claim in table.values()
+            if claim.get("live") and claim.get("sessionId")
+        }
+        for item in result.get("sessions", []):
+            lease = live_by_session.get(item.get("sessionId"))
+            if lease is not None:
+                item["lease"] = {
+                    "host": lease.get("host"),
+                    "lane": lease.get("lane"),
+                    "branch": lease.get("branch"),
+                    "checkout": lease.get("checkout"),
+                    "expiresAt": lease.get("expiresAt"),
+                }
+        return result
     if command == "events":
         return {"events": read_events(float(request.get("after", 0)), int(request.get("limit", 200)))}
     if command == "pending":
@@ -1279,8 +1721,118 @@ async def dispatch(host: MspHost, request: dict[str, Any]) -> Any:
                     "museVersion": probe.get("version", ""),
                 }
             )
+            # P4: the P3 registry heartbeat IS the lease heartbeat — re-gossip
+            # this host's ownership claims on it. No second heartbeat exists.
+            refreshed = refresh_claims(request["name"])
+            if refreshed:
+                beat = make_heartbeat(request["name"], agent_id(), list(refreshed))
+                publish("m8s.heartbeat", beat)
+                host.record(
+                    {
+                        "kind": "claim.heartbeat",
+                        "host": request["name"],
+                        "claims": [c["branch"] for c in refreshed],
+                        "summary": f"re-gossiped {len(refreshed)} claim(s) on heartbeat",
+                    }
+                )
             return {"host": record}
         raise HostError("badHostName", f"unknown host action: {action!r}")
+    if command == "bus":
+        action = request.get("action", "list")
+        if action == "claim":
+            if not request.get("lane") or not request.get("branch"):
+                raise BusError(
+                    "badMessage", "bus claim requires --lane and --branch"
+                )
+            session_id = None
+            if request.get("session"):
+                session_id = host.resolve(request["session"])
+            claim = claim_branch(
+                request.get("host") or local_host(),
+                request["lane"],
+                request["branch"],
+                request.get("checkout"),
+                session_id,
+                request.get("ttl"),
+            )
+            host.record(
+                {
+                    "kind": "claim.acquired",
+                    "host": claim["host"],
+                    "lane": claim["lane"],
+                    "branch": claim["branch"],
+                    "summary": f"{claim['host']} holds lane {claim['lane']} "
+                    f"on branch {claim['branch']}",
+                }
+            )
+            return {"claim": claim}
+        if action == "release":
+            if not request.get("branch"):
+                raise BusError("badMessage", "bus release requires --branch")
+            claim = release_claim(request["branch"], request.get("host"))
+            host.record({"kind": "claim.released", "branch": request["branch"]})
+            return {"claim": claim}
+        if action == "list":
+            for expired in sweep_claims():
+                host.record(
+                    {
+                        "kind": "claim.expired",
+                        "host": expired.get("host"),
+                        "lane": expired.get("lane"),
+                        "branch": expired.get("branch"),
+                        "requeue": True,
+                        "summary": f"lease on {expired.get('branch')} expired; "
+                        "branch requeued for reassignment",
+                    }
+                )
+            return {"claims": claim_table()}
+        if action == "heartbeat":
+            name = request.get("host") or local_host()
+            refreshed = refresh_claims(name, ttl=request.get("ttl"))
+            beat = make_heartbeat(name, agent_id(), list(refreshed))
+            if refreshed:
+                publish("m8s.heartbeat", beat)
+            host.record(
+                {
+                    "kind": "claim.heartbeat",
+                    "host": name,
+                    "claims": [c["branch"] for c in refreshed],
+                    "summary": f"re-gossiped {len(refreshed)} claim(s) on heartbeat",
+                }
+            )
+            return {"host": name, "refreshed": refreshed, "heartbeat": beat}
+        if action == "intent":
+            if not request.get("verb"):
+                raise BusError("badMessage", "bus intent requires --verb")
+            session_id = None
+            if request.get("session"):
+                session_id = host.resolve(request["session"])
+            intent = make_intent(
+                request.get("host") or local_host(),
+                request["verb"],
+                request.get("lane"),
+                request.get("branch"),
+                request.get("detail"),
+                session_id,
+                request.get("ttl"),
+            )
+            publish("m8s.intent", intent)
+            host.record(
+                {
+                    "kind": "intent.published",
+                    "host": intent["host"],
+                    "verb": intent["verb"],
+                    "branch": intent.get("branch"),
+                }
+            )
+            return {"intent": intent}
+        if action == "read":
+            return {
+                "records": read_bus(
+                    request.get("subject"), int(request.get("limit", 200))
+                )
+            }
+        raise BusError("badMessage", f"unknown bus action: {action!r}")
     if command == "place":
         spec = {
             key: request[key]
@@ -1459,6 +2011,29 @@ def parser() -> argparse.ArgumentParser:
     place.add_argument("--checkout", help="repo checkout path (affinity)")
     place.add_argument("--files", help="comma-separated files (collision zone)")
 
+    bus_cmd = sub.add_parser(
+        "bus", help="claim/heartbeat/intent bus: branch leases and gossip (Moonshot P4)"
+    )
+    bus_cmd.add_argument(
+        "action",
+        choices=("claim", "release", "list", "heartbeat", "intent", "read"),
+        help="claim/release a branch lease, list leases, heartbeat, publish intent, read log",
+    )
+    bus_cmd.add_argument("--host", help="claiming host (default: this hostname)")
+    bus_cmd.add_argument("--lane", help="lane holding the lease (claim/intent)")
+    bus_cmd.add_argument("--branch", help="branch under lease (claim/release/intent)")
+    bus_cmd.add_argument("--checkout", help="repo checkout path (claim: one writer each)")
+    bus_cmd.add_argument("--session", help="session alias or id tied to the claim/intent")
+    bus_cmd.add_argument("--ttl", type=int, help="lease/intent TTL seconds")
+    bus_cmd.add_argument("--verb", help="intent verb, e.g. propose-plan (intent)")
+    bus_cmd.add_argument("--detail", help="intent detail text (intent)")
+    bus_cmd.add_argument(
+        "--subject",
+        choices=list(BUS_SUBJECTS),
+        help="bus subject filter (read)",
+    )
+    bus_cmd.add_argument("--limit", type=int, default=200, help="bus log lines (read)")
+
     call = sub.add_parser(
         "call",
         help="generic MSP passthrough: call any schema method (covers all 51)",
@@ -1620,6 +2195,30 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
             request["maxLanes"] = args.max_lanes
         if args.remote_msp:
             request["remoteMsp"] = args.remote_msp
+        return request
+    if command == "bus":
+        if args.action == "claim" and (not args.lane or not args.branch):
+            raise SystemExit("bus claim requires --lane and --branch")
+        if args.action == "release" and not args.branch:
+            raise SystemExit("bus release requires --branch")
+        if args.action == "intent" and not args.verb:
+            raise SystemExit("bus intent requires --verb")
+        request = {"command": "bus", "action": args.action}
+        for key in (
+            "host",
+            "lane",
+            "branch",
+            "checkout",
+            "session",
+            "ttl",
+            "verb",
+            "detail",
+            "subject",
+            "limit",
+        ):
+            value = getattr(args, key, None)
+            if value is not None:
+                request[key] = value
         return request
     if command == "place":
         request = {"command": "place"}
