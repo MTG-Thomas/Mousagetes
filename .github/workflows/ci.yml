@@ -17,3 +17,29 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: python3 -m unittest discover -s scripts/tests -v
       - run: python3 scripts/bump-version.py --check
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ruff
+      - run: ruff check scripts/ --select F,E9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Check embedded web UI script
+        run: |
+          python3 - scripts/muse-msp.py web-page.js <<'EOF'
+          import importlib.util, sys
+          spec = importlib.util.spec_from_file_location("m", sys.argv[1])
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          html = module.WEB_INDEX
+          open("web-page.js", "w").write(
+              html.split("<script>", 1)[1].rsplit("</script>", 1)[0]
+          )
+          EOF
+          node --check web-page.js
