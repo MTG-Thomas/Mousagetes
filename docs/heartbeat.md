@@ -162,6 +162,12 @@ without supervisor judgment: `--force` ends supervision while the work
 is still unlanded. Retire records a `lane.retired` event; refusals are
 typed (`sessionBusy`, `uncommittedWork`, `openPR`).
 
+When shedding load for host capacity (issue #19), prefer the
+attributable path — `scripts/muse-msp.py unload <session> --reason
+capacity --by <operator>` — which judges the same guards with no
+override and records `lane.unloaded` with the roster count
+before/after. See [docs/capacity.md](capacity.md).
+
 ### 6. Report (material changes only)
 
 No "still running" noise. Report to the user only: dispatches,
