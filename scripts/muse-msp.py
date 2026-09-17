@@ -148,7 +148,7 @@ COMMAND_METHODS = frozenset(
 )
 
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 
 def uuid7() -> str:
@@ -332,6 +332,346 @@ def repo_activity_ts(workspace: str | None) -> float | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Moonshot P3: second host over SSH with registry and namespaced identity.
+#
+# Transport rule (docs/moonshot.md): `muse serve` is stdio-only. MSP never
+# goes on a raw network listener — SSH (OpenSSH CLI, stdlib subprocess) is
+# the only sanctioned carrier. A remote host is therefore a local `ssh`
+# subprocess whose stdio carries the peer's `muse serve` frames.
+# ---------------------------------------------------------------------------
+
+# Local `muse serve` argv owned by this agent. Remote hosts wrap the same
+# argv in ssh (see build_ssh_serve_argv); no TCP/port/bind option exists.
+SERVE_ARGV = ("muse", "serve", "--trust-workspace", "--disable-sandbox")
+
+HOSTS_FILE = RUNTIME / "hosts.json"
+
+# Liveness TTL for enrolled hosts. Overridable via M8S_HOST_TTL_SECONDS;
+# invalid values fall back to the default.
+HOST_ALIVE_TTL_SECONDS = 120
+
+# Host names double as lane-namespace prefixes (`host/alias`), so they must
+# not contain the `/` separator.
+HOST_NAME_RE = r"[A-Za-z0-9][A-Za-z0-9_.-]*"
+
+
+def host_ttl_seconds() -> int:
+    try:
+        return max(1, int(os.environ.get("M8S_HOST_TTL_SECONDS", HOST_ALIVE_TTL_SECONDS)))
+    except (TypeError, ValueError):
+        return HOST_ALIVE_TTL_SECONDS
+
+
+def agent_id() -> str:
+    """Stable id of this agent: hostname plus its own control socket path.
+
+    One m8s agent owns exactly one serve process per host; the registry
+    records this id so a second agent cannot silently share the host —
+    federation is agent-to-agent, never by sharing a host.
+    """
+    import socket
+
+    return f"{socket.gethostname()}:{SOCKET}"
+
+
+class HostError(ValueError):
+    """Typed registry/carrier error.
+
+    ``kind`` is machine-readable: "badHostName", "hostExists",
+    "hostNotFound", "hostOwned", "hostUnreachable", "noCapacity",
+    "noRemoteMsp".
+    """
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+def check_host_name(name: str) -> None:
+    import re
+
+    if not isinstance(name, str) or not re.fullmatch(HOST_NAME_RE, name):
+        raise HostError(
+            "badHostName",
+            f"invalid host name {name!r}: use letters, digits, '_', '-', '.' (no '/')",
+        )
+
+
+def build_ssh_serve_argv(target: str, ssh_port: int | None = None) -> list[str]:
+    """Argv carrying a peer's `muse serve` stdio over SSH.
+
+    stdlib subprocess with the OpenSSH CLI, no shell, no network listener:
+    `ssh [port] target -- muse serve ...`. Raises HostError on an empty
+    target or an invalid port.
+    """
+    if not isinstance(target, str) or not target.strip() or any(
+        ch.isspace() for ch in target
+    ):
+        raise HostError("badHostName", f"invalid SSH target: {target!r}")
+    if ssh_port is not None and (
+        isinstance(ssh_port, bool) or not isinstance(ssh_port, int) or not 1 <= ssh_port <= 65535
+    ):
+        raise HostError("badHostName", f"invalid SSH port: {ssh_port!r}")
+    argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
+    if ssh_port is not None:
+        argv += ["-p", str(ssh_port)]
+    argv += [target, "--", *SERVE_ARGV]
+    return argv
+
+
+def ssh_probe(
+    target: str,
+    ssh_port: int | None = None,
+    timeout: int = 20,
+    run: Any = None,
+) -> dict[str, Any]:
+    """Verify a host is reachable and carries `muse` before enrolling it.
+
+    Runs `command -v muse && muse --version` over SSH (BatchMode: fail fast
+    instead of prompting). Returns {"target", "musePath", "version"} or
+    raises HostError("hostUnreachable"). ``run`` injects the subprocess
+    runner for tests; defaults to subprocess.run.
+    """
+    import subprocess as _subprocess
+
+    runner = run or _subprocess.run
+    if not isinstance(target, str) or not target.strip():
+        raise HostError("badHostName", f"invalid SSH target: {target!r}")
+    argv = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}"]
+    if ssh_port is not None:
+        argv += ["-p", str(ssh_port)]
+    argv += [target, "command -v muse && muse --version"]
+    try:
+        proc = runner(argv, capture_output=True, text=True, timeout=timeout + 10)
+    except (OSError, _subprocess.SubprocessError) as exc:
+        raise HostError("hostUnreachable", f"SSH probe to {target!r} failed: {exc}")
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:300]
+        raise HostError("hostUnreachable", f"SSH probe to {target!r} failed: {detail}")
+    lines = (proc.stdout or "").strip().splitlines()
+    return {
+        "target": target,
+        "musePath": lines[0].strip() if lines else "",
+        "version": lines[1].strip() if len(lines) > 1 else "",
+    }
+
+
+def load_hosts() -> dict[str, dict[str, Any]]:
+    try:
+        raw = json.loads(HOSTS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def save_hosts(hosts: dict[str, dict[str, Any]]) -> None:
+    HOSTS_FILE.write_text(json.dumps(hosts, sort_keys=True), encoding="utf-8")
+
+
+def host_alive(record: dict[str, Any], now: float, ttl: int | None = None) -> bool:
+    """A host is live when its last heartbeat is inside the TTL window."""
+    limit = HOST_ALIVE_TTL_SECONDS if ttl is None else ttl
+    if not record.get("alive", False):
+        return False
+    seen = record.get("lastHeartbeat")
+    return isinstance(seen, (int, float)) and (now - seen) <= limit
+
+
+def enroll_host(
+    name: str,
+    ssh_target: str,
+    max_lanes: int = 4,
+    ssh_port: int | None = None,
+    remote_msp: str | None = None,
+    owner: str | None = None,
+    probe: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Enroll a host after a successful SSH probe. Pure registry write.
+
+    ``probe`` is the ssh_probe() result (injected by callers/tests; when
+    None the caller already probed). Re-enroll by the same owner updates the
+    record; a different live owner is refused — exactly one agent per host.
+    """
+    check_host_name(name)
+    if isinstance(max_lanes, bool) or not isinstance(max_lanes, int) or max_lanes < 1:
+        raise HostError("badHostName", f"maxLanes must be a positive integer: {max_lanes!r}")
+    hosts = load_hosts()
+    me = owner or agent_id()
+    existing = hosts.get(name)
+    if existing and existing.get("agentId") not in (None, me):
+        if host_alive(existing, time.time()):
+            raise HostError(
+                "hostOwned",
+                f"host {name!r} is owned by live agent {existing['agentId']}; "
+                "federate agent-to-agent instead of sharing the host",
+            )
+    record = {
+        "name": name,
+        "sshTarget": ssh_target,
+        "maxLanes": max_lanes,
+        "agentId": me,
+        "enrolledAt": existing.get("enrolledAt", time.time()) if existing else time.time(),
+        "lastHeartbeat": time.time(),
+        "alive": True,
+    }
+    if ssh_port is not None:
+        record["sshPort"] = ssh_port
+    if remote_msp is not None:
+        record["remoteMsp"] = remote_msp
+    elif existing and existing.get("remoteMsp"):
+        record["remoteMsp"] = existing["remoteMsp"]
+    if probe:
+        record["musePath"] = probe.get("musePath", "")
+        record["museVersion"] = probe.get("version", "")
+    hosts[name] = record
+    save_hosts(hosts)
+    return record
+
+
+def remove_host(name: str) -> dict[str, Any]:
+    hosts = load_hosts()
+    if name not in hosts:
+        raise HostError("hostNotFound", f"unknown host: {name!r}")
+    record = hosts.pop(name)
+    save_hosts(hosts)
+    return record
+
+
+def heartbeat_host(name: str, alive: bool = True) -> dict[str, Any]:
+    hosts = load_hosts()
+    record = hosts.get(name)
+    if record is None:
+        raise HostError("hostNotFound", f"unknown host: {name!r}")
+    record["alive"] = bool(alive)
+    record["lastHeartbeat"] = time.time()
+    hosts[name] = record
+    save_hosts(hosts)
+    return record
+
+
+def split_lane_ref(reference: str) -> tuple[str | None, str]:
+    """Split a lane reference into (host, alias).
+
+    Unqualified aliases address this host's lanes; `host/alias` addresses a
+    peer host's lane with no cross-host alias collisions. Raises HostError
+    ("badHostName") on empty parts or extra separators.
+    """
+    if not isinstance(reference, str) or not reference:
+        raise HostError("badHostName", f"invalid lane reference: {reference!r}")
+    if "/" not in reference:
+        return None, reference
+    host, alias = reference.split("/", 1)
+    if not host or not alias or "/" in alias:
+        raise HostError(
+            "badHostName",
+            f"invalid lane reference {reference!r}: want 'alias' or 'host/alias'",
+        )
+    check_host_name(host)
+    return host, alias
+
+
+def qualify_lane(host: str, alias: str) -> str:
+    """Namespaced lane identity: `host/alias`, unique across the federation."""
+    check_host_name(host)
+    if not alias or "/" in alias:
+        raise HostError("badHostName", f"invalid lane alias: {alias!r}")
+    return f"{host}/{alias}"
+
+
+def peer_cli_argv(record: dict[str, Any], cli_args: list[str]) -> list[str]:
+    """Argv invoking the peer agent's own m8s CLI over SSH (agent-to-agent).
+
+    Never touches the peer's serve stdio — the peer agent owns its serve
+    process and this side only speaks to its control CLI. Requires the
+    host's `remoteMsp` path (never guessed: remote home layouts are unknown).
+    """
+    remote = record.get("remoteMsp")
+    if not remote:
+        raise HostError(
+            "noRemoteMsp",
+            f"host {record.get('name')!r} has no remoteMsp path; "
+            "re-enroll with --remote-msp pointing at its muse-msp.py",
+        )
+    argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
+    if record.get("sshPort") is not None:
+        argv += ["-p", str(record["sshPort"])]
+    argv += [record["sshTarget"], "--", "python3", remote, *cli_args]
+    return argv
+
+
+def place_lane(
+    spec: dict[str, Any],
+    hosts: dict[str, dict[str, Any]],
+    lanes_by_host: dict[str, list[dict[str, Any]]],
+    now: float | None = None,
+) -> list[dict[str, Any]]:
+    """Rank enrolled hosts for a lane spec (pure placement function).
+
+    Considers, per docs/moonshot.md Scheduler row: collision zone (shared
+    branch or overlapping files lose big), checkout affinity (a host already
+    holding this checkout wins), and capacity (full or dead hosts are out;
+    free slots score). Returns [{host, score, reasons}] best-first; empty
+    when nothing can take the lane.
+    """
+    at = time.time() if now is None else now
+    branch = spec.get("branch")
+    files = [str(f) for f in (spec.get("files") or [])]
+    checkout = spec.get("checkout")
+    ranked: list[dict[str, Any]] = []
+    for name in sorted(hosts):
+        record = hosts[name]
+        reasons: list[str] = []
+        if not host_alive(record, at):
+            continue
+        lanes = lanes_by_host.get(name, [])
+        free = int(record.get("maxLanes", 0)) - len(lanes)
+        if free <= 0:
+            continue
+        score = 10 * free
+        reasons.append(f"capacity {len(lanes)}/{record.get('maxLanes')} ({free} free)")
+        collision = None
+        for lane in lanes:
+            if branch and lane.get("branch") == branch:
+                collision = f"branch {branch!r} already held on {name}"
+                break
+            for other in (lane.get("files") or []):
+                other = str(other)
+                if any(
+                    f == other or f.startswith(other + "/") or other.startswith(f + "/")
+                    for f in files
+                ):
+                    collision = f"file overlap {other!r} on {name}"
+                    break
+            if collision:
+                break
+        if collision:
+            score -= 1000
+            reasons.append(f"collision: {collision}")
+        if checkout and any(lane.get("checkout") == checkout for lane in lanes):
+            score += 50
+            reasons.append(f"checkout affinity: {checkout} already on {name}")
+        ranked.append({"host": name, "score": score, "reasons": reasons})
+    ranked.sort(key=lambda item: (-item["score"], item["host"]))
+    return ranked
+
+
+def pick_host(
+    spec: dict[str, Any],
+    hosts: dict[str, dict[str, Any]],
+    lanes_by_host: dict[str, list[dict[str, Any]]],
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Best placement for a lane spec, or HostError("noCapacity")."""
+    ranked = place_lane(spec, hosts, lanes_by_host, now)
+    if not ranked or ranked[0]["score"] < 0:
+        raise HostError(
+            "noCapacity",
+            "no enrolled host can take the lane without a collision zone conflict",
+        )
+    return ranked[0]
+
+
 class CallValidationError(ValueError):
     """Typed client-side error for the generic `call` passthrough.
 
@@ -403,12 +743,13 @@ class MspHost:
         for writer in stale:
             self.watchers.discard(writer)
 
+    def serve_argv(self) -> list[str]:
+        """Argv whose stdio carries this host's `muse serve` frames."""
+        return list(SERVE_ARGV)
+
     async def start(self) -> None:
         self.proc = await asyncio.create_subprocess_exec(
-            "muse",
-            "serve",
-            "--trust-workspace",
-            "--disable-sandbox",
+            *self.serve_argv(),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -429,7 +770,7 @@ class MspHost:
                 "clientInfo": {
                     "name": "codex_muse_supervisor",
                     "title": "Codex Muse supervisor",
-                    "version": "0.2.0",
+                    "version": "0.3.0",
                 },
                 "capabilities": {
                     "experimentalApi": True,
@@ -817,6 +1158,25 @@ class MspHost:
         return result
 
 
+class RemoteMspHost(MspHost):
+    """An MspHost whose serve stdio is carried over SSH.
+
+    Identical supervision (budgets, stuck detection, call validation) to a
+    local host: only the spawn argv differs — `ssh target -- muse serve …`
+    instead of a local `muse serve`. MSP itself never sees a socket or a
+    port; SSH is the carrier. The peer host still runs its own m8s agent
+    owning that serve process (one agent, one serve per host).
+    """
+
+    def __init__(self, ssh_target: str, ssh_port: int | None = None) -> None:
+        super().__init__()
+        self.ssh_target = ssh_target
+        self.ssh_port = ssh_port
+
+    def serve_argv(self) -> list[str]:
+        return build_ssh_serve_argv(self.ssh_target, self.ssh_port)
+
+
 def summarize_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
     if method == "userInput/request":
         return {
@@ -877,6 +1237,59 @@ async def dispatch(host: MspHost, request: dict[str, Any]) -> Any:
         if spec:
             return await host.set_budget(request["session"], spec)
         return await host.get_budget(request["session"])
+    if command == "host":
+        action = request.get("action", "list")
+        if action == "list":
+            now = time.time()
+            return {
+                "hosts": [
+                    {**record, "live": host_alive(record, now, host_ttl_seconds())}
+                    for _, record in sorted(load_hosts().items())
+                ]
+            }
+        if action == "enroll":
+            if not request.get("name") or not request.get("target"):
+                raise HostError("badHostName", "host enroll requires --name and --target")
+            max_lanes = request.get("maxLanes", 4)
+            probe = ssh_probe(request["target"], request.get("sshPort"), timeout=20)
+            record = enroll_host(
+                request["name"],
+                request["target"],
+                max_lanes,
+                request.get("sshPort"),
+                request.get("remoteMsp"),
+                probe=probe,
+            )
+            host.record({"kind": "host.enrolled", "host": record["name"]})
+            return {"host": record}
+        if action == "remove":
+            record = remove_host(request["name"])
+            host.record({"kind": "host.removed", "host": request["name"]})
+            return {"host": record}
+        if action == "heartbeat":
+            known = load_hosts().get(request.get("name", ""))
+            if known is None:
+                raise HostError("hostNotFound", f"unknown host: {request.get('name')!r}")
+            probe = ssh_probe(known["sshTarget"], known.get("sshPort"), timeout=20)
+            record = heartbeat_host(request["name"], alive=True)
+            host.record(
+                {
+                    "kind": "host.heartbeat",
+                    "host": request["name"],
+                    "museVersion": probe.get("version", ""),
+                }
+            )
+            return {"host": record}
+        raise HostError("badHostName", f"unknown host action: {action!r}")
+    if command == "place":
+        spec = {
+            key: request[key]
+            for key in ("branch", "checkout", "files")
+            if request.get(key) is not None
+        }
+        return {
+            "ranking": place_lane(spec, load_hosts(), request.get("lanesByHost") or {})
+        }
     if command == "stop":
         host.stopping.set()
         return {"stopping": True}
@@ -1033,6 +1446,19 @@ def parser() -> argparse.ArgumentParser:
     budget.add_argument("--models", help="comma-separated model allowlist")
     budget.add_argument("--clear", action="store_true", help="remove the lane budget")
 
+    host_cmd = sub.add_parser("host", help="enroll/list/remove/heartbeat SSH hosts")
+    host_cmd.add_argument("action", choices=("enroll", "list", "remove", "heartbeat"))
+    host_cmd.add_argument("--name", help="host name (enroll/remove/heartbeat)")
+    host_cmd.add_argument("--target", help="SSH target, e.g. user@peer (enroll)")
+    host_cmd.add_argument("--ssh-port", type=int, help="SSH port (enroll)")
+    host_cmd.add_argument("--max-lanes", type=int, default=4, help="lane capacity (enroll)")
+    host_cmd.add_argument("--remote-msp", help="remote path to muse-msp.py (enroll)")
+
+    place = sub.add_parser("place", help="dry-run placement ranking for a lane spec")
+    place.add_argument("--branch", help="lane branch (collision zone)")
+    place.add_argument("--checkout", help="repo checkout path (affinity)")
+    place.add_argument("--files", help="comma-separated files (collision zone)")
+
     call = sub.add_parser(
         "call",
         help="generic MSP passthrough: call any schema method (covers all 51)",
@@ -1182,6 +1608,28 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
         }
     if command == "pending":
         return {"command": "pending", "session": args.session}
+    if command == "host":
+        request: dict[str, Any] = {"command": "host", "action": args.action}
+        if args.name:
+            request["name"] = args.name
+        if args.target:
+            request["target"] = args.target
+        if args.ssh_port is not None:
+            request["sshPort"] = args.ssh_port
+        if args.max_lanes is not None:
+            request["maxLanes"] = args.max_lanes
+        if args.remote_msp:
+            request["remoteMsp"] = args.remote_msp
+        return request
+    if command == "place":
+        request = {"command": "place"}
+        if args.branch:
+            request["branch"] = args.branch
+        if args.checkout:
+            request["checkout"] = args.checkout
+        if args.files:
+            request["files"] = [f.strip() for f in args.files.split(",") if f.strip()]
+        return request
     if command == "budget":
         request = {"command": "budget", "session": args.session}
         if args.clear:
