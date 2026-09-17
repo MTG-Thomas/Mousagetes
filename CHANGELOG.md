@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- `m8s health` fused swarm screen (issue #11): per member, liveness
+  (`list` status + last-event age), recent turn activity, and progress
+  (branch-ahead commits, read-only `gh` open-PR checks, pending
+  approvals/inputs). Exactly three flags — `down` (listed but
+  unresponsive past `M8S_DOWN_AFTER_SECONDS`, default 2h), `stuck`
+  (P2 idle on events and commits, or a dead turn awaiting owner
+  action), `blocked` (approval/user-input wait, wins over silence) —
+  with P4 lease state riding along on each row.
+
 ## v0.2.0
 
 - Per-lane budgets (`budget` command, `launch --max-tokens/--max-context-tokens/--models`):

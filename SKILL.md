@@ -28,7 +28,7 @@ scripts/muse-msp.py launch \
   --prompt 'Concrete lane brief'
 ```
 
-Use `scripts/muse-msp.py list`, `events`, `send`, and `pending` for supervision. The controller records operational event summaries under its private runtime directory. It does not copy model reasoning or full transcript output into its event log.
+Use `scripts/muse-msp.py list`, `events`, `send`, and `pending` for supervision, and `scripts/muse-msp.py health` for the fused one-screen swarm view (liveness, recent turns, progress; flags are exactly `down`/`stuck`/`blocked`). The controller records operational event summaries under its private runtime directory. It does not copy model reasoning or full transcript output into its event log.
 
 The controller reacts to MSP notifications rather than scanning session logs. Its
 `events`/`watch` output includes `session/tokenUsage` events, whose
