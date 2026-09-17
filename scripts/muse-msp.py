@@ -148,7 +148,7 @@ COMMAND_METHODS = frozenset(
 )
 
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 
 def uuid7() -> str:
@@ -1094,6 +1094,663 @@ def claim_table(
     return table
 
 
+# ---------------------------------------------------------------------------
+# Moonshot P5: board-to-lane compiler (desired state -> lane specs).
+#
+# The compiler reads a file-based board snapshot (issues + milestones) and
+# emits lane specs with deterministic priority arbitration, collision
+# queuing on top of the P4 branch-lease/claim table (no parallel ownership
+# system), and decision-blocked stops that page a human instead of
+# guessing. A `gh`-driven exporter builds the snapshot read-only; the
+# compiler itself never touches the network. All `board` commands run
+# daemonless (they read the same file-backed state `list`/`events` show),
+# so planning never needs the controller socket.
+# ---------------------------------------------------------------------------
+
+BOARD_SCHEMA_VERSION = 1
+
+# Priority label -> weight. `p0..p3` are accepted as aliases for the
+# critical..low scale; anything else weighs 1 (unprioritized, not ignored).
+PRIORITY_WEIGHTS = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+
+# Staleness divisor: score grows by 1/30 per idle day, so a month-old
+# issue at the same priority/depth outranks a fresh one without
+# ever dwarfing the priority term.
+STALENESS_DIVISOR_DAYS = 30.0
+
+# Decision classes that stop a lane and page a human (moonshot
+# stewardship). "spend" reuses the P2 budget-breaching decisionClass value
+# so paging surfaces stay uniform.
+DECISION_CLASSES = ("product", "auth", "spend")
+
+DECISION_LABELS = {
+    "product": (
+        "decision-needed",
+        "needs-decision",
+        "needs-product-call",
+        "product-call",
+    ),
+    "auth": ("needs-auth", "auth-boundary", "needs-credentials", "needs-access"),
+    "spend": ("needs-spend", "spend", "needs-budget", "over-budget"),
+}
+
+DECISION_BODY_MARKERS = (
+    "decision required",
+    "needs product call",
+    "waiting on human",
+    "needs owner",
+    "auth boundary",
+)
+
+
+class BoardError(ValueError):
+    """Typed board-compiler error. ``kind`` is machine-readable."""
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+def board_priority(labels: list[str]) -> tuple[int, str]:
+    """Weight an issue's priority labels. Highest label wins; default 1."""
+    best = 1
+    reason = "no priority label (weight 1)"
+    for label in labels:
+        name = label.strip().lower()
+        if name.startswith("priority-"):
+            name = name[len("priority-"):]
+        weight = PRIORITY_WEIGHTS.get(name)
+        if weight is None and len(name) == 2 and name[0] == "p" and name[1] in "0123":
+            weight = 4 - int(name[1])
+            name = {"p0": "critical", "p1": "high", "p2": "medium", "p3": "low"}[name]
+        if weight is not None and weight > best:
+            best = weight
+            reason = f"label {label!r} (weight {weight})"
+    return best, reason
+
+
+def board_dependency_depth(issues: list[dict[str, Any]]) -> dict[int, int]:
+    """Unblock depth per open issue number: longest chain of open issues
+    transitively depending on it (0 when nothing depends on it). Blockers
+    therefore outrank the blocked, which keeps scheduling order
+    dependency-safe. Cycles resolve deterministically (back edge scores 0)
+    and are reported by :func:`board_dependency_cycles`."""
+    open_numbers = {
+        int(item["number"]) for item in issues if item.get("state", "open") == "open"
+    }
+    dependents: dict[int, list[int]] = {number: [] for number in open_numbers}
+    for item in issues:
+        number = int(item["number"])
+        if number not in open_numbers:
+            continue
+        for dep in item.get("dependsOn") or []:
+            try:
+                dep_number = int(dep)
+            except (TypeError, ValueError):
+                continue
+            if dep_number in dependents and number != dep_number:
+                dependents[dep_number].append(number)
+    depth: dict[int, int] = {}
+
+    def visit(number: int, trail: tuple[int, ...]) -> int:
+        if number in depth:
+            return depth[number]
+        best = 0
+        for child in sorted(dependents.get(number, ())):
+            if child in trail:
+                continue
+            best = max(best, 1 + visit(child, trail + (number,)))
+        if number not in trail:
+            depth[number] = best
+        return best
+
+    for number in sorted(open_numbers):
+        visit(number, ())
+    return depth
+
+
+def board_dependency_cycles(issues: list[dict[str, Any]]) -> list[list[int]]:
+    """Closed dependsOn loops among open issues (each sorted, list sorted)."""
+    open_numbers = {
+        int(item["number"]) for item in issues if item.get("state", "open") == "open"
+    }
+    edges: dict[int, list[int]] = {}
+    for item in issues:
+        number = int(item["number"])
+        if number not in open_numbers:
+            continue
+        targets = set()
+        for dep in item.get("dependsOn") or []:
+            try:
+                dep_number = int(dep)
+            except (TypeError, ValueError):
+                continue
+            if dep_number in open_numbers and dep_number != number:
+                targets.add(dep_number)
+        edges[number] = sorted(targets)
+    cycles: set[tuple[int, ...]] = set()
+    for start in sorted(edges):
+        stack: list[tuple[int, list[int]]] = [(start, [start])]
+        while stack:
+            node, path = stack.pop()
+            for target in edges.get(node, ()):
+                if target == start and len(path) > 1:
+                    cycles.add(tuple(sorted(path)))
+                elif target not in path and target > start:
+                    stack.append((target, path + [target]))
+    return [list(cycle) for cycle in sorted(cycles)]
+
+
+def parse_board_time(value: Any) -> float | None:
+    """Epoch seconds from a snapshot timestamp: epoch numbers as-is,
+    ISO-8601 strings (the ``gh`` shape) parsed, anything else None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            pass
+        try:
+            from datetime import datetime, timezone
+
+            moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            return moment.timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def board_staleness(updated_at: Any, now: float) -> tuple[float, float]:
+    """(idle days, staleness factor 1 + days/30). Unparseable timestamps
+    read as fresh (0 days) rather than failing the whole plan."""
+    parsed = parse_board_time(updated_at)
+    idle = max(0.0, (now - parsed) / 86400.0) if parsed is not None else 0.0
+    return idle, 1.0 + idle / STALENESS_DIVISOR_DAYS
+
+
+def classify_decision(issue: dict[str, Any]) -> dict[str, str] | None:
+    """Decision-blocked classification, or None when the lane may proceed.
+
+    Signals: an explicit ``decisionBlocked: {class, reason}`` field on the
+    snapshot issue, decision labels (see DECISION_LABELS), or body markers
+    (see DECISION_BODY_MARKERS). Explicit field beats labels beats markers;
+    the first matching class in DECISION_CLASSES order wins.
+    """
+    explicit = issue.get("decisionBlocked")
+    if isinstance(explicit, dict) and explicit.get("class") in DECISION_CLASSES:
+        return {
+            "class": str(explicit["class"]),
+            "reason": str(explicit.get("reason") or "marked decision-blocked"),
+        }
+    labels = {str(label).strip().lower() for label in (issue.get("labels") or [])}
+    for cls in DECISION_CLASSES:
+        for marker in DECISION_LABELS[cls]:
+            if marker in labels:
+                return {"class": cls, "reason": f"label {marker!r}"}
+    body = str(issue.get("body") or "").lower()
+    for marker in DECISION_BODY_MARKERS:
+        if marker in body:
+            for cls in DECISION_CLASSES:
+                if cls in marker or (cls == "product" and "product" in marker):
+                    return {"class": cls, "reason": f"body marker {marker!r}"}
+            return {"class": "product", "reason": f"body marker {marker!r}"}
+    return None
+
+
+def slugify(text: str, words: int = 5) -> str:
+    """Lowercase alphanumeric slug of the first few title words."""
+    import re
+
+    parts = re.findall(r"[a-z0-9]+", text.lower())[:words]
+    return "-".join(parts) or "untitled"
+
+
+def scope_overlap(first: dict[str, Any], second: dict[str, Any]) -> str | None:
+    """Collision-zone overlap between two lane scopes (P3 rule reused):
+    same branch, same checkout, or overlapping files (equal or nested).
+    Returns a human-readable reason or None."""
+    if first.get("branch") and first.get("branch") == second.get("branch"):
+        return f"branch {first['branch']!r}"
+    if first.get("checkout") and first.get("checkout") == second.get("checkout"):
+        return f"checkout {first['checkout']!r}"
+    first_files = [str(f) for f in (first.get("files") or [])]
+    second_files = [str(f) for f in (second.get("files") or [])]
+    for mine in first_files:
+        for other in second_files:
+            if mine == other or mine.startswith(other + "/") or other.startswith(mine + "/"):
+                return f"file overlap {mine!r} vs {other!r}"
+    return None
+
+
+def compile_board(
+    board: dict[str, Any], now: float | None = None
+) -> dict[str, Any]:
+    """Compile a board snapshot into ranked lane specs (pure function).
+
+    Score is deterministic: ``priority x (1 + dependency depth) x
+    staleness``; ties break by issue number. Every spec cites its
+    components in ``priority.why`` so a scheduled lane can say why it was
+    scheduled. Closed issues are skipped; decision-blocked issues compile
+    to ``status: decision-blocked`` and never schedule.
+    """
+    at = time.time() if now is None else now
+    raw_issues = board.get("issues") or []
+    if not isinstance(raw_issues, list):
+        raise BoardError("badBoard", "board snapshot needs an 'issues' list")
+    issues = [item for item in raw_issues if isinstance(item, dict)]
+    depth = board_dependency_depth(issues)
+    cycles = board_dependency_cycles(issues)
+    open_blockers: dict[int, list[int]] = {}
+    open_numbers = {
+        int(item["number"]) for item in issues if item.get("state", "open") == "open"
+    }
+    for item in issues:
+        number = int(item.get("number", 0))
+        blockers = []
+        for dep in item.get("dependsOn") or []:
+            try:
+                dep_number = int(dep)
+            except (TypeError, ValueError):
+                continue
+            if dep_number in open_numbers and dep_number != number:
+                blockers.append(dep_number)
+        open_blockers[number] = sorted(blockers)
+    specs: list[dict[str, Any]] = []
+    for item in issues:
+        if item.get("state", "open") != "open":
+            continue
+        try:
+            number = int(item["number"])
+        except (TypeError, ValueError, KeyError) as exc:
+            raise BoardError("badBoard", f"issue needs an integer number: {exc}")
+        labels = [str(label) for label in (item.get("labels") or [])]
+        weight, weight_why = board_priority(labels)
+        issue_depth = depth.get(number, 0)
+        idle_days, stale_factor = board_staleness(item.get("updatedAt"), at)
+        score = round(weight * (1 + issue_depth) * stale_factor, 3)
+        scope = item.get("scope") or {}
+        branch = scope.get("branch") or f"lane/m8s-{number}-{slugify(str(item.get('title', '')))}"
+        title = str(item.get("title") or f"issue #{number}")
+        body = str(item.get("body") or "").strip()
+        brief = body.splitlines()[0].strip() if body else title
+        blocked = classify_decision(item)
+        spec: dict[str, Any] = {
+            "lane": f"m8s-{number}",
+            "issue": number,
+            "title": title,
+            "branch": branch,
+            "checkout": scope.get("checkout"),
+            "files": [str(f) for f in (scope.get("files") or [])],
+            "brief": brief[:280],
+            "priority": {
+                "score": score,
+                "weight": weight,
+                "depth": issue_depth,
+                "stalenessDays": round(idle_days, 2),
+                "why": [
+                    weight_why,
+                    f"dependency depth {issue_depth}",
+                    f"stale {idle_days:.1f}d (factor {stale_factor:.3f})",
+                ],
+            },
+            "blockedBy": open_blockers.get(number, []),
+            "status": "candidate",
+        }
+        if blocked is not None:
+            spec["status"] = "decision-blocked"
+            spec["decisionBlocked"] = blocked
+            spec["pageHuman"] = True
+        specs.append(spec)
+    specs.sort(key=lambda spec: (-spec["priority"]["score"], spec["issue"]))
+    return {
+        "schemaVersion": BOARD_SCHEMA_VERSION,
+        "repo": board.get("repo"),
+        "compiledAt": at,
+        "dependencyCycles": cycles,
+        "specs": specs,
+    }
+
+
+def apply_collisions(
+    specs: list[dict[str, Any]],
+    live_claims: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Collision pass over ranked specs (pure function). The first
+    schedulable spec in rank order wins each collision zone; later specs
+    overlapping an already-scheduled spec — or a live P4 lease on the
+    branch/checkout — queue with ``queuedBehind`` citing the winner.
+    Decision-blocked specs pass through untouched (they never schedule).
+    """
+    claims = live_claims or {}
+    live_by_branch = {
+        branch: claim
+        for branch, claim in claims.items()
+        if claim.get("live", True)
+    }
+    live_checkouts = {
+        str(claim.get("checkout")): claim
+        for claim in live_by_branch.values()
+        if claim.get("checkout")
+    }
+    scheduled: list[dict[str, Any]] = []
+    for spec in specs:
+        if spec.get("status") == "decision-blocked":
+            continue
+        conflict: str | None = None
+        holder = live_by_branch.get(spec.get("branch", ""))
+        if holder is not None and holder.get("lane") != spec.get("lane"):
+            conflict = (
+                f"branch {spec['branch']!r} leased to "
+                f"{holder.get('host')}/{holder.get('lane')}"
+            )
+        if conflict is None and spec.get("checkout"):
+            busy = live_checkouts.get(str(spec["checkout"]))
+            if busy is not None and busy.get("lane") != spec.get("lane"):
+                conflict = (
+                    f"checkout {spec['checkout']!r} has its writer: "
+                    f"{busy.get('host')}/{busy.get('lane')}"
+                )
+        if conflict is None:
+            for winner in scheduled:
+                overlap = scope_overlap(spec, winner)
+                if overlap is not None:
+                    conflict = (
+                        f"scope collision ({overlap}) with "
+                        f"scheduled issue #{winner['issue']}"
+                    )
+                    break
+        if conflict is None:
+            spec["status"] = "scheduled"
+            scheduled.append(spec)
+        else:
+            spec["status"] = "queued"
+            spec["queuedBehind"] = conflict
+    return specs
+
+
+def plan_board(
+    board: dict[str, Any],
+    live_claims: dict[str, dict[str, Any]] | None = None,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Full planning pass: compile, then collide. ``live_claims`` defaults
+    to the real P4 lease table (reuse, not a parallel ownership system);
+    pass an explicit table (or {}) in tests and dry runs."""
+    at = time.time() if now is None else now
+    compiled = compile_board(board, at)
+    if live_claims is None:
+        try:
+            live_claims = claim_table(at)
+        except (OSError, ValueError):
+            live_claims = {}
+    compiled["specs"] = apply_collisions(compiled["specs"], live_claims)
+    return compiled
+
+
+def load_board_snapshot(path: str) -> dict[str, Any]:
+    """Read and validate a board snapshot file."""
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise BoardError("badBoard", f"board snapshot not found: {path}")
+    except (OSError, ValueError) as exc:
+        raise BoardError("badBoard", f"board snapshot unreadable: {exc}")
+    if not isinstance(raw, dict):
+        raise BoardError("badBoard", "board snapshot must be a JSON object")
+    if not isinstance(raw.get("issues"), list):
+        raise BoardError("badBoard", "board snapshot needs an 'issues' list")
+    return raw
+
+
+def export_board_snapshot(
+    repo: str, run: Any = None, limit: int = 100
+) -> dict[str, Any]:
+    """Build a board snapshot with read-only ``gh`` calls (issues plus
+    milestones). ``run`` injects the subprocess runner (tests); default is
+    ``subprocess.run``. Never writes to GitHub — the coordinator owns
+    board writes.
+
+    Projects v2 board columns are deliberately NOT read here: the v2 API
+    is GraphQL-only with cursor pagination that fits poorly behind
+    stdlib/gh one-liners, so the file snapshot is the compiler's input
+    contract and project-column state travels as issue labels/milestones.
+    """
+    import subprocess
+
+    runner = run or subprocess.run
+
+    def gh(*argv: str) -> Any:
+        proc = runner(
+            ["gh", *argv], capture_output=True, text=True, timeout=60
+        )
+        if proc.returncode != 0:
+            raise BoardError(
+                "ghFailed", f"gh {' '.join(argv)} failed: {proc.stderr.strip()}"
+            )
+        try:
+            return json.loads(proc.stdout or "null")
+        except ValueError as exc:
+            raise BoardError("ghFailed", f"gh output unparseable: {exc}")
+
+    raw_issues = gh(
+        "issue",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        "open",
+        "--limit",
+        str(limit),
+        "--json",
+        "number,title,labels,milestone,updatedAt,body",
+    )
+    try:
+        raw_milestones = gh(
+            "api", f"repos/{repo}/milestones?state=open&per_page=100"
+        )
+    except BoardError:
+        raw_milestones = []
+    milestones = []
+    if isinstance(raw_milestones, list):
+        for milestone in raw_milestones:
+            if isinstance(milestone, dict):
+                milestones.append(
+                    {
+                        "number": milestone.get("number"),
+                        "title": milestone.get("title"),
+                        "dueOn": milestone.get("due_on"),
+                    }
+                )
+    issues = []
+    for entry in raw_issues if isinstance(raw_issues, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        labels = entry.get("labels") or []
+        names = [
+            label.get("name") if isinstance(label, dict) else label
+            for label in labels
+        ]
+        milestone = entry.get("milestone") or {}
+        issues.append(
+            {
+                "number": entry.get("number"),
+                "title": entry.get("title"),
+                "labels": [str(name) for name in names if name],
+                "milestone": milestone.get("title") if isinstance(milestone, dict) else None,
+                "state": "open",
+                "updatedAt": entry.get("updatedAt"),
+                "body": entry.get("body"),
+            }
+        )
+    return {
+        "schemaVersion": BOARD_SCHEMA_VERSION,
+        "repo": repo,
+        "exportedAt": time.time(),
+        "milestones": milestones,
+        "issues": issues,
+    }
+
+
+def board_reconcile(
+    board: dict[str, Any],
+    live_claims: dict[str, dict[str, Any]] | None = None,
+    recent_events: list[dict[str, Any]] | None = None,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Drive actual lane state toward the planned desired state (pure core).
+
+    Compares the plan against live P4 leases and recent supervision events
+    (the same state ``list``/``events`` show: stuck lanes, spend breaches,
+    expired leases). Emits one action per spec — ``propose`` (free to
+    schedule: operator runs ``bus claim`` + ``launch``), ``in-sync``
+    (already leased), ``queued`` (collision), ``page-human``
+    (decision-blocked) — plus ``requeue`` entries for expired leases on
+    desired branches and an ``attention`` list for stuck/over-budget
+    signals. Reconcile never claims, launches, or guesses: it proposes
+    and pages.
+    """
+    at = time.time() if now is None else now
+    plan = plan_board(board, live_claims, at)
+    claims = live_claims if live_claims is not None else {}
+    actions: list[dict[str, Any]] = []
+    for spec in plan["specs"]:
+        if spec.get("status") == "decision-blocked":
+            actions.append(
+                {
+                    "lane": spec["lane"],
+                    "issue": spec["issue"],
+                    "action": "page-human",
+                    "decisionClass": spec["decisionBlocked"]["class"],
+                    "reason": spec["decisionBlocked"]["reason"],
+                }
+            )
+        elif spec.get("status") == "queued":
+            actions.append(
+                {
+                    "lane": spec["lane"],
+                    "issue": spec["issue"],
+                    "action": "queued",
+                    "reason": spec.get("queuedBehind"),
+                }
+            )
+        else:
+            lease = claims.get(spec.get("branch", "")) or {}
+            if lease.get("live"):
+                actions.append(
+                    {
+                        "lane": spec["lane"],
+                        "issue": spec["issue"],
+                        "action": "in-sync",
+                        "reason": (
+                            f"leased to {lease.get('host')}/{lease.get('lane')}"
+                        ),
+                    }
+                )
+            else:
+                actions.append(
+                    {
+                        "lane": spec["lane"],
+                        "issue": spec["issue"],
+                        "action": "propose",
+                        "branch": spec["branch"],
+                        "brief": spec["brief"],
+                        "priority": spec["priority"],
+                        "reason": (
+                            "no live lease on branch; run `bus claim` + `launch`"
+                        ),
+                    }
+                )
+    requeue = sorted(
+        {
+            branch
+            for branch, claim in claims.items()
+            if not claim.get("live", True)
+            and any(spec.get("branch") == branch for spec in plan["specs"])
+        }
+    )
+    attention: list[dict[str, Any]] = []
+    for event in recent_events or []:
+        kind = event.get("kind")
+        if kind in ("lane.stuck", "lane.attention"):
+            attention.append(
+                {
+                    "kind": kind,
+                    "sessionId": event.get("sessionId"),
+                    "reason": event.get("reason") or event.get("detail"),
+                }
+            )
+        elif kind == "budget.exceeded" or event.get("decisionClass") == SPEND_DECISION_CLASS:
+            attention.append(
+                {
+                    "kind": "budget.exceeded",
+                    "sessionId": event.get("sessionId"),
+                    "limit": event.get("limit") or (event.get("detail") or {}).get("limit"),
+                }
+            )
+    plan["actions"] = actions
+    plan["requeue"] = requeue
+    plan["attention"] = attention
+    return plan
+
+
+def board_main(args: Any) -> dict[str, Any]:
+    """Daemonless `board` commands: export (gh read-only), plan (compile +
+    collide), reconcile (desired vs actual + paging events)."""
+    action = args.board_action
+    if action == "export":
+        if not args.repo:
+            raise SystemExit("board export requires --repo OWNER/REPO")
+        snapshot = export_board_snapshot(args.repo, limit=args.limit)
+        if args.out:
+            Path(args.out).write_text(
+                json.dumps(snapshot, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        return {"snapshot": snapshot, "wrote": args.out}
+    if action == "plan":
+        if not args.board:
+            raise SystemExit("board plan requires --board FILE")
+        board = load_board_snapshot(args.board)
+        return {"plan": plan_board(board)}
+    if action == "reconcile":
+        if not args.board:
+            raise SystemExit("board reconcile requires --board FILE")
+        board = load_board_snapshot(args.board)
+        try:
+            claims = claim_table()
+        except (OSError, ValueError):
+            claims = {}
+        try:
+            events = read_events(0, args.events_limit)
+        except (OSError, ValueError):
+            events = []
+        plan = board_reconcile(board, claims, events)
+        for item in plan["actions"]:
+            if item["action"] == "page-human":
+                emit_local(
+                    {
+                        "kind": "board.decisionBlocked",
+                        "decisionClass": item["decisionClass"],
+                        "lane": item["lane"],
+                        "issue": item["issue"],
+                        "summary": (
+                            f"lane {item['lane']} decision-blocked "
+                            f"({item['decisionClass']}): human call required"
+                        ),
+                    }
+                )
+        return {"reconcile": plan}
+    raise SystemExit(f"unknown board action: {action}")
+
+
 class CallValidationError(ValueError):
     """Typed client-side error for the generic `call` passthrough.
 
@@ -2034,6 +2691,22 @@ def parser() -> argparse.ArgumentParser:
     )
     bus_cmd.add_argument("--limit", type=int, default=200, help="bus log lines (read)")
 
+    board_cmd = sub.add_parser(
+        "board", help="board-to-lane compiler: export/plan/reconcile (Moonshot P5)"
+    )
+    board_cmd.add_argument(
+        "board_action",
+        choices=("export", "plan", "reconcile"),
+        help="export a snapshot via gh (read-only), plan lane specs, reconcile desired vs actual",
+    )
+    board_cmd.add_argument("--repo", help="OWNER/REPO for board export")
+    board_cmd.add_argument("--board", help="board snapshot JSON file (plan/reconcile)")
+    board_cmd.add_argument("--out", help="write exported snapshot here (export)")
+    board_cmd.add_argument("--limit", type=int, default=100, help="issues to export (export)")
+    board_cmd.add_argument(
+        "--events-limit", type=int, default=200, help="recent events to scan (reconcile)"
+    )
+
     call = sub.add_parser(
         "call",
         help="generic MSP passthrough: call any schema method (covers all 51)",
@@ -2357,6 +3030,16 @@ def main() -> int:
     args = parser().parse_args()
     if args.command == "serve":
         return asyncio.run(serve())
+    if args.command == "board":
+        # Planning is daemonless: the compiler reads the board snapshot
+        # file plus the same file-backed lease/event state list/events
+        # show, so it never needs the controller socket.
+        try:
+            result = board_main(args)
+        except BoardError as exc:
+            raise SystemExit(f"{exc.kind}: {exc}")
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
     if args.command == "up":
         result = start_daemon()
     else:
