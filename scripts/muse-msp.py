@@ -199,6 +199,50 @@ def save_budgets(budgets: dict[str, dict[str, Any]]) -> None:
     BUDGETS_FILE.write_text(json.dumps(budgets, sort_keys=True), encoding="utf-8")
 
 
+# Retired sessions (issue #21): served sessions whose duty is complete stay
+# on the roster as idle members and accrue `stuck` flags. Retiring drops a
+# session from supervision; the retired ids persist here so a daemon bounce
+# never resurrects them into the roster, health, or stuck accounting.
+RETIRED_FILE = RUNTIME / "retired.json"
+
+
+def load_retired() -> dict[str, dict[str, Any]]:
+    try:
+        raw = json.loads(RETIRED_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def save_retired(retired: dict[str, dict[str, Any]]) -> None:
+    RETIRED_FILE.write_text(json.dumps(retired, sort_keys=True), encoding="utf-8")
+
+
+def worktree_dirty(workspace: str | None, run: Any = None) -> bool | None:
+    """Uncommitted-work signal for a lane worktree (never raises).
+
+    True means `git status --porcelain` reports entries; False means clean.
+    None means unknown (no workspace, not a repo, or git unavailable) —
+    callers judge by the remaining signals alone. `run` injects the
+    subprocess runner (tests); default is `subprocess.run`.
+    """
+    if not workspace:
+        return None
+    runner = run or subprocess.run
+    try:
+        proc = runner(
+            ["git", "-C", str(workspace), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return bool((proc.stdout or "").strip())
+
+
 def normalize_budget(spec: dict[str, Any]) -> dict[str, Any]:
     """Coerce a lane budget to {maxTokens?, maxContextTokens?, models?}.
 
@@ -1775,6 +1819,22 @@ class BudgetExceededError(ValueError):
         self.kind = kind
 
 
+class RetireError(ValueError):
+    """Typed retire error (issue #21): refusing to end a served session.
+
+    ``kind`` is machine-readable: "sessionNotFound" (unknown alias/id, or
+    already retired), "sessionRetired" (new work addressed to a retired
+    session), "sessionBusy" (pending approvals/inputs or a dead turn
+    awaiting owner action), "uncommittedWork" (dirty worktree), "openPR"
+    (an open PR on the lane branch). Busy/dirty/PR refusals lift with the
+    explicit supervisor override (``retire --force``).
+    """
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
 def validate_call(
     method: str,
     params: dict[str, Any] | None = None,
@@ -1809,6 +1869,7 @@ class MspHost:
         self.watchers: set[asyncio.StreamWriter] = set()
         self.stopping = asyncio.Event()
         self.budgets: dict[str, dict[str, Any]] = load_budgets()
+        self.retired: dict[str, dict[str, Any]] = load_retired()
 
     def record(self, record: dict[str, Any]) -> None:
         saved = emit_local(record)
@@ -1980,8 +2041,18 @@ class MspHost:
                 }
             )
 
+    def _retired_ids(self) -> set[str]:
+        """Retired session ids (empty when the host predates retire state)."""
+        retired = getattr(self, "retired", None)
+        return set(retired) if isinstance(retired, dict) else set()
+
     async def _notification(self, method: str, params: dict[str, Any]) -> None:
         session_id = params.get("sessionId")
+        if session_id and session_id in self._retired_ids():
+            # A retired lane stays retired: served frames for it are still
+            # logged below, but never re-tracked into the roster (no
+            # resurrection across daemon restarts).
+            session_id = None
         if session_id:
             state = self.sessions.setdefault(session_id, {"sessionId": session_id})
             state["lastActivity"] = time.time()
@@ -2092,6 +2163,8 @@ class MspHost:
 
     async def submit(self, reference: str, prompt: str, reasoning: str | None = None) -> dict[str, Any]:
         session_id = self.resolve(reference)
+        if session_id in self._retired_ids():
+            raise RetireError("sessionRetired", f"session is retired, not supervised: {reference!r}")
         self.enforce_budget(session_id)
         params: dict[str, Any] = {
             "commandId": uuid7(),
@@ -2117,6 +2190,108 @@ class MspHost:
         state.pop("lastTerminal", None)
         state.pop("stuckFlagged", None)
 
+    async def retire(self, reference: str, force: bool = False) -> dict[str, Any]:
+        """End a served session whose duty is complete (issue #21).
+
+        Confirms the session is idle (no pending approvals/inputs, no dead
+        turn awaiting owner action), then refuses sessions with uncommitted
+        work or an open PR unless ``force`` carries the explicit supervisor
+        override. On success the session leaves the roster, its alias and
+        budget slots free up, its branch lease (if any) is released, and
+        its id persists in the retired set so restarts never resurrect it
+        into the roster, health, or stuck accounting.
+
+        Raises RetireError ("sessionNotFound" / "sessionBusy" /
+        "uncommittedWork" / "openPR").
+        """
+        session_id = self.resolve(reference)
+        state = self.sessions.get(session_id)
+        if state is None:
+            if session_id in self._retired_ids():
+                raise RetireError("sessionNotFound", f"session already retired: {reference!r}")
+            raise RetireError("sessionNotFound", f"unknown session: {reference!r}")
+        try:
+            pending_result = await self.call("approval/listPending", {"sessionId": session_id})
+        except Exception:
+            pending_result = {}
+        counts = pending_counts(pending_result, state.get("attention"))
+        if (counts["approvals"] + counts["inputs"] > 0 or state.get("needsOwnerAction")) and not force:
+            raise RetireError(
+                "sessionBusy",
+                f"session {reference!r} is not idle "
+                f"(approvals={counts['approvals']}, inputs={counts['inputs']}, "
+                f"needsOwnerAction={bool(state.get('needsOwnerAction'))}); "
+                "stand it down first or retire with --force",
+            )
+        workspace = state.get("workspace")
+        dirty = worktree_dirty(workspace) if workspace else None
+        if dirty and not force:
+            raise RetireError(
+                "uncommittedWork",
+                f"session {reference!r} has uncommitted work in {workspace}; "
+                "land it first or retire with --force",
+            )
+        branch = health_progress_for_workspace(workspace).get("branch") if workspace else None
+        pr = health_pr_for_branch(branch, workspace) if branch else None
+        if pr is not None and not force:
+            raise RetireError(
+                "openPR",
+                f"session {reference!r} has an open PR on {branch} "
+                f"(PR #{pr.get('number')}); merge or close it first or retire with --force",
+            )
+        released: dict[str, Any] | None = None
+        try:
+            for leased_branch, claim in load_claims().items():
+                if claim.get("sessionId") == session_id:
+                    release_claim(leased_branch)
+                    released = {
+                        "branch": leased_branch,
+                        "lane": claim.get("lane"),
+                        "host": claim.get("host"),
+                    }
+                    break
+        except Exception:
+            released = None
+        alias = state.get("alias")
+        self.sessions.pop(session_id, None)
+        for name in [name for name, owned in self.aliases.items() if owned == session_id]:
+            del self.aliases[name]
+        self.budgets.pop(session_id, None)
+        save_budgets(self.budgets)
+        retired = dict(getattr(self, "retired", None) or {})
+        retired[session_id] = {
+            "alias": alias,
+            "retiredAt": time.time(),
+            "forced": bool(force),
+        }
+        self.retired = retired
+        save_retired(retired)
+        self.record(
+            {
+                "kind": "lane.retired",
+                "sessionId": session_id,
+                "alias": alias,
+                "forced": bool(force),
+                "releasedClaim": released,
+                "summary": f"lane {alias or session_id} retired"
+                + (" (forced)" if force else ""),
+            }
+        )
+        return {
+            "sessionId": session_id,
+            "alias": alias,
+            "forced": bool(force),
+            "idle": counts,
+            "worktree": {
+                "workspace": workspace,
+                "dirty": dirty,
+                "branch": branch,
+                "pr": pr,
+            },
+            "releasedClaim": released,
+            "retired": True,
+        }
+
     async def list_sessions(self) -> dict[str, Any]:
         result = await self.call("session/list", {"limit": 200})
         now = time.time()
@@ -2124,6 +2299,8 @@ class MspHost:
         owned = []
         for item in result.get("sessions", []):
             session_id = item["sessionId"]
+            if session_id in self._retired_ids():
+                continue
             if session_id not in self.sessions:
                 continue
             state = self.sessions[session_id]
@@ -2308,6 +2485,10 @@ class MspHost:
             merged["commandId"] = uuid7() if command_id in (None, "auto") else command_id
         session_id = merged.get("sessionId")
         if session_id:
+            if session_id in self._retired_ids():
+                raise RetireError(
+                    "sessionRetired", f"session is retired, not supervised: {session_id!r}"
+                )
             if method == "turn/start":
                 self.enforce_budget(session_id)
             elif method == "session/setModel":
@@ -2763,6 +2944,8 @@ async def dispatch(host: MspHost, request: dict[str, Any]) -> Any:
         return await host.launch(request)
     if command == "send":
         return await host.submit(request["session"], request["prompt"], request.get("reasoningEffort"))
+    if command == "retire":
+        return await host.retire(request["session"], force=bool(request.get("force")))
     if command == "list":
         result = await host.list_sessions()
         # P4: lease state rides along — the full claim table plus the live
@@ -3123,6 +3306,16 @@ def parser() -> argparse.ArgumentParser:
     send.add_argument("--reasoning-effort")
     pending = sub.add_parser("pending", help="list pending approvals and user input")
     pending.add_argument("session")
+    retire = sub.add_parser(
+        "retire", help="end a served session: confirm idle, drop it from roster/health"
+    )
+    retire.add_argument("session", help="session alias or id to retire")
+    retire.add_argument(
+        "--force",
+        action="store_true",
+        help="explicit supervisor override: retire a busy session or one with "
+        "uncommitted work / an open PR",
+    )
     health_cmd = sub.add_parser(
         "health", help="fused swarm health screen: liveness, turns, progress, down/stuck/blocked"
     )
@@ -3339,6 +3532,8 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
         }
     if command == "pending":
         return {"command": "pending", "session": args.session}
+    if command == "retire":
+        return {"command": "retire", "session": args.session, "force": args.force}
     if command == "health":
         return {"command": "health", "eventsLimit": args.events_limit}
     if command == "host":

@@ -129,6 +129,39 @@ scripts/muse-msp.py send <session> '<minimal instruction>'
 scripts/muse-msp.py list   # confirm the turn is actually running
 ```
 
+### 5b. Stand-down and retire (issue #21)
+
+A served session whose duty is complete must not linger on the roster:
+after 30+ minutes idle it accrues a `stuck` flag and masks genuinely
+live lanes on the health screen. End it in two steps, supervisor-owned:
+
+1. **Stand down by message.** Send the session a stand-down instruction
+   (wrap up, land or report any uncommitted work, confirm idle). This is
+   still just a `send` — the session does the wrapping up, not the
+   supervisor.
+2. **Retire.** Once the session confirms idle:
+
+```bash
+scripts/muse-msp.py retire <session>
+scripts/muse-msp.py list   # session gone; no stuck accrual afterwards
+```
+
+`retire` confirms idle (no pending approvals/inputs, no dead turn
+awaiting owner action), refuses sessions with uncommitted work or an
+open PR, releases the lane's branch lease, and drops the session from
+the roster, health, and stuck accounting. The retired id persists across
+daemon restarts — a bounced daemon never resurrects it. The only
+override is explicit:
+
+```bash
+scripts/muse-msp.py retire <session> --force
+```
+
+Never force-retire a session with uncommitted work or an open PR
+without supervisor judgment: `--force` ends supervision while the work
+is still unlanded. Retire records a `lane.retired` event; refusals are
+typed (`sessionBusy`, `uncommittedWork`, `openPR`).
+
 ### 6. Report (material changes only)
 
 No "still running" noise. Report to the user only: dispatches,
