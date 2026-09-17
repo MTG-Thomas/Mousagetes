@@ -1,0 +1,80 @@
+name: Release draft
+
+# Keeps a "Release vNEXT" PR open while ## Unreleased accumulates.
+# Numbering comes from merged-PR labels (semver:patch/minor/major,
+# defaulting to minor for unlabeled PRs). Merging the release PR is the
+# human gate; release-tag.yml cuts the tag from there.
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: release-draft
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Draft or update release PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          UNRELEASED=$(python3 -c "
+          import re
+          text = open('CHANGELOG.md', encoding='utf-8').read()
+          m = re.search(r'^##\s+Unreleased\s*$(.*?)(?=^##\s+|\Z)', text, re.MULTILINE | re.DOTALL)
+          print((m.group(1).strip() if m else ''))
+          ")
+          if [ -z "$UNRELEASED" ]; then
+            echo "Unreleased is empty; nothing to draft."
+            exit 0
+          fi
+          BASE=$(python3 -c "
+          import re
+          m = re.search(r'^__version__\s*=\s*\"([^\"]+)\"', open('scripts/muse-msp.py').read(), re.MULTILINE)
+          print(m.group(1))
+          ")
+          TAG="v$BASE"
+          SINCE=$(git log -1 --format=%cI "$TAG" 2>/dev/null || echo "1970-01-01T00:00:00Z")
+          LABEL_ARGS=$(gh pr list --state merged --base main --limit 30 \
+            --json labels,mergedAt \
+            --jq --arg since "$SINCE" \
+            '[.[] | select(.mergedAt > $since) | ([.labels[].name] | join(","))] | .[] | "--pr=\(.)"' \
+            | tr '\n' ' ')
+          if [ -z "$LABEL_ARGS" ]; then
+            echo "No merged PRs since $TAG; nothing to draft."
+            exit 0
+          fi
+          # shellcheck disable=SC2086
+          NEXT=$(python3 scripts/next-version.py --base "$BASE" $LABEL_ARGS)
+          BRANCH="release-v$NEXT"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          python3 scripts/bump-version.py --release "$NEXT"
+          git add scripts/muse-msp.py pyproject.toml CHANGELOG.md
+          git commit -m "Release v$NEXT" || true
+          git push --force-with-lease origin "$BRANCH" || git push --force origin "$BRANCH"
+          BODY="$(printf 'Automated release draft from ## Unreleased (labels since %s).\nMerge to cut the release; the tag workflow publishes from there.\n\n%s' "$TAG" "$UNRELEASED")"
+          EXISTING=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh pr edit "$EXISTING" --title "Release v$NEXT" --body "$BODY"
+          else
+            for OLD in $(gh pr list --head 'release-v*' --state open --json headRefName --jq '.[].headRefName'); do
+              [ "$OLD" = "$BRANCH" ] || gh pr close "$OLD" --comment "Superseded by the v$NEXT draft." || true
+            done
+            gh pr create --head "$BRANCH" --base main --title "Release v$NEXT" --body "$BODY"
+          fi

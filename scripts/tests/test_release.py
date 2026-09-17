@@ -97,5 +97,48 @@ class ReleaseTest(unittest.TestCase):
                 bump.release_version(root, "0.6.0")
 
 
+class NextVersionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "next_version", Path(__file__).resolve().parent.parent / "next-version.py"
+        )
+        self.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.mod)
+
+    def test_major_wins(self) -> None:
+        self.assertEqual(
+            self.mod.next_version(
+                "0.5.0", [frozenset({"semver:patch"}), frozenset({"semver:major"})]
+            ),
+            "1.0.0",
+        )
+
+    def test_minor_on_feature_or_unknown(self) -> None:
+        self.assertEqual(
+            self.mod.next_version("0.5.0", [frozenset({"semver:minor"})]), "0.6.0"
+        )
+        self.assertEqual(
+            self.mod.next_version("0.5.0", [frozenset({"bug"})]), "0.6.0"
+        )
+        self.assertEqual(self.mod.next_version("0.5.0", [frozenset()]), "0.6.0")
+
+    def test_patch_only_when_all_patch(self) -> None:
+        self.assertEqual(
+            self.mod.next_version(
+                "0.5.0", [frozenset({"semver:patch"}), frozenset({"semver:patch"})]
+            ),
+            "0.5.1",
+        )
+
+    def test_no_prs_means_nothing(self) -> None:
+        self.assertIsNone(self.mod.next_version("0.5.0", []))
+
+    def test_bad_base_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self.mod.next_version("nope", [frozenset({"semver:patch"})])
+
+
 if __name__ == "__main__":
     unittest.main()

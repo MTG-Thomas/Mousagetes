@@ -1,17 +1,25 @@
 # Release process
 
-Work lands on `main` under a `## Unreleased` CHANGELOG section. Cutting a
-release is three operator steps — everything else is automated:
+Work lands on `main` under a `## Unreleased` CHANGELOG section. In the
+steady state nobody cuts releases by hand:
 
-1. `python3 scripts/bump-version.py --release X.Y.Z` — sets
-   `__version__` (canonical, in `scripts/muse-msp.py`) and
-   `pyproject.toml`, promotes `## Unreleased` to `## vX.Y.Z`.
-2. Commit as `Release vX.Y.Z`, push.
-3. `git tag vX.Y.Z && git push origin vX.Y.Z` — the release workflow
-   verifies the tag against the three version sources, extracts the
-   CHANGELOG section as notes, and publishes the GitHub release.
+1. **Label merged PRs** with `semver:patch`, `semver:minor`, or
+   `semver:major` (unlabeled PRs count as minor). This is the only
+   manual step, and it is the version-numbering decision.
+2. **Release draft** (`.github/workflows/release-draft.yml`): each push
+   to `main` with a non-empty `## Unreleased` recomputes the next
+   version from merged-PR labels since the last tag
+   (`scripts/next-version.py`), runs `bump-version.py --release`, and
+   opens or updates a `Release vNEXT` PR. Superseded drafts close
+   themselves.
+3. **Merge the release PR** when it looks right — that merge is the
+   human gate. `release-tag.yml` then cuts tag `vNEXT`, and
+   `release.yml` verifies the tag, extracts the CHANGELOG notes, and
+   publishes the GitHub release.
 
-CI enforces version consistency on every push and PR
-(`bump-version.py --check`): script, pyproject, and newest
-`## vX.Y.Z` heading must agree. The release workflow
-(`.github/workflows/release.yml`) refuses tags that do not match.
+Manual escape hatch (unchanged): `bump-version.py --release X.Y.Z`,
+commit `Release vX.Y.Z`, `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+Version sources: `__version__` in `scripts/muse-msp.py` is canonical;
+CI enforces it against `pyproject.toml` and the newest `## vX.Y.Z`
+heading on every push and PR.
