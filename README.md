@@ -16,6 +16,10 @@ Muse coding sessions over MSP (`muse serve`) and external-agent ingress.
   versioned `m8s.claims` / `m8s.heartbeat` / `m8s.intent` messages with
   branch-level leases, heartbeat re-gossip, and expiry into reassignment —
   see [docs/bus.md](docs/bus.md).
+- Board-to-lane compiler (`board export|plan|reconcile`): file-based board
+  snapshot compiled into ranked lane specs with deterministic priority
+  arbitration, P4-lease collision queuing, decision-blocked paging, and a
+  reconcile loop — see [docs/compile.md](docs/compile.md).
 
 ## Use
 
