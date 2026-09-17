@@ -125,7 +125,7 @@ sessions (re-send once, then restart via an authorized path or reassign
 the lane — never force-migrate a live TUI-owned session).
 
 ```bash
-scripts/muse-msp.py send <session> --text '<minimal instruction>'
+scripts/muse-msp.py send <session> '<minimal instruction>'
 scripts/muse-msp.py list   # confirm the turn is actually running
 ```
 
