@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mousagetes"
+version = "0.1.0"
+description = "Mousagetes (m8s): thin local supervisor for live Muse coding sessions over MSP"
+readme = "README.md"
+license = { text = "AGPL-3.0-or-later" }
+requires-python = ">=3.10"
+authors = [{ name = "MTG-Thomas" }]
+
+[project.urls]
+Homepage = "https://github.com/MTG-Thomas/Mousagetes"
+
+[tool.setuptools]
+script-files = ["scripts/muse-msp.py"]

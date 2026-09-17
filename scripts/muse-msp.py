@@ -87,6 +87,9 @@ COMMAND_METHODS = frozenset(
 )
 
 
+__version__ = "0.1.0"
+
+
 def uuid7() -> str:
     """Mint an RFC 9562 UUIDv7 without depending on Python 3.14."""
     value = ((int(time.time() * 1000) & ((1 << 48) - 1)) << 80)
@@ -514,6 +517,7 @@ async def watch(after: float, limit: int) -> None:
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("serve", help=argparse.SUPPRESS)
     sub.add_parser("up", help="start the MSP controller daemon")
