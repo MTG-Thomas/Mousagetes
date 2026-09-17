@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Verify tag matches versions
+        run: python3 scripts/bump-version.py --check-tag "${GITHUB_REF#refs/tags/}"
+      - name: Extract release notes
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          python3 - "${TAG}" CHANGELOG.md release-notes.md <<'EOF'
+          import re, sys
+          tag, changelog, out = sys.argv[1], sys.argv[2], sys.argv[3]
+          text = open(changelog, encoding="utf-8").read()
+          match = re.search(
+              rf"^##\s+{re.escape(tag)}\s*$(.*?)(?=^##\s+|\Z)",
+              text, re.MULTILINE | re.DOTALL,
+          )
+          if not match or not match.group(1).strip():
+              sys.exit(f"no CHANGELOG section for {tag}")
+          open(out, "w", encoding="utf-8").write(match.group(1).strip() + "\n")
+          EOF
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          gh release create "${TAG}" --title "${TAG}" --notes-file release-notes.md
