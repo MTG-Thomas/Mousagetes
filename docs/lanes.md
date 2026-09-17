@@ -148,6 +148,13 @@ merge gate:
 gh issue comment N --body "Heartbeat (<stage>): ..."
 ```
 
+Evidence rule: back every status claim with inspected evidence. Open
+the implementation or test body cited and quote what it shows — grep or
+search output alone never counts as verification. Anything checked but
+not resolved (a failing test outside scope, a thread left open, a board
+move still blocked) is recorded explicitly in the heartbeat as an
+unresolved item; nothing is silently dropped.
+
 ## 5. Draft PR at first push
 
 Open the PR as a draft at the first push, not at completion, so
