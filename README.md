@@ -12,6 +12,10 @@ Muse coding sessions over MSP (`muse serve`) and external-agent ingress.
   `events`, `watch`, `send`, `pending`, `read`, `view`, `goal`, `turn`,
   `workflow`, `subagent`, `task`, …) plus a generic `call` passthrough with
   automatic `commandId` minting.
+- Claim/heartbeat/intent bus (`bus claim|release|list|heartbeat|intent|read`):
+  versioned `m8s.claims` / `m8s.heartbeat` / `m8s.intent` messages with
+  branch-level leases, heartbeat re-gossip, and expiry into reassignment —
+  see [docs/bus.md](docs/bus.md).
 
 ## Use
 
