@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import http.server
 import json
 import os
 import secrets
@@ -18,8 +19,9 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 
 def runtime_dir() -> Path:
@@ -185,6 +187,37 @@ def stuck_after_seconds() -> int:
         return max(1, int(os.environ.get("M8S_STUCK_AFTER_SECONDS", STUCK_IDLE_SECONDS)))
     except (TypeError, ValueError):
         return STUCK_IDLE_SECONDS
+
+
+SESSIONS_FILE = RUNTIME / "sessions.json"
+
+
+def save_roster(
+    sessions: dict[str, dict[str, Any]],
+    aliases: dict[str, str],
+    path: Path = SESSIONS_FILE,
+) -> None:
+    path.write_text(
+        json.dumps({"sessions": sessions, "aliases": aliases}, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def load_roster(
+    path: Path = SESSIONS_FILE,
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}, {}
+    if not isinstance(raw, dict):
+        return {}, {}
+    sessions = raw.get("sessions")
+    aliases = raw.get("aliases")
+    if not isinstance(sessions, dict) or not isinstance(aliases, dict):
+        return {}, {}
+    return sessions, aliases
 
 
 def load_budgets() -> dict[str, dict[str, Any]]:
@@ -2146,6 +2179,47 @@ class MspHost:
                 await self.proc.wait()
         self.record({"kind": "controller.stopped"})
 
+    def snapshot_roster(self, path: Path | None = None) -> None:
+        """Persist ownership for post-bounce restore. Any membership
+        remover (retire) must delete from the snapshot too, or the dead
+        return on the next restore."""
+        save_roster(self.sessions, self.aliases, path or SESSIONS_FILE)
+
+    async def restore_roster(self, path: Path | None = None) -> dict[str, int]:
+        """Re-register snapshotted sessions the new serve host still knows.
+
+        Unknown (dead) ids are dropped, never resurrected. Total: a missing
+        or corrupt snapshot, or an unreachable host, restores nothing and
+        never prevents startup.
+        """
+        sessions, aliases = load_roster(path or SESSIONS_FILE)
+        try:
+            listed = await self.call("session/list", {"limit": 200})
+            live = {item.get("sessionId") for item in listed.get("sessions", [])}
+        except Exception:
+            return {"restored": 0, "dropped": len(sessions)}
+        restored = 0
+        dropped = 0
+        for session_id, state in sessions.items():
+            if session_id not in live:
+                dropped += 1
+                continue
+            self.sessions[session_id] = state
+            restored += 1
+        for alias, session_id in aliases.items():
+            if session_id in self.sessions:
+                self.aliases[alias] = session_id
+        for state in self.sessions.values():
+            self.refresh_budget_flag(state)
+        self.record(
+            {
+                "kind": "controller.rosterRestored",
+                "restored": restored,
+                "dropped": dropped,
+            }
+        )
+        return {"restored": restored, "dropped": dropped}
+
     async def _write(self, frame: dict[str, Any]) -> None:
         if not self.proc or not self.proc.stdin:
             raise RuntimeError("Muse host is not running")
@@ -2345,6 +2419,7 @@ class MspHost:
         self.aliases[alias] = session_id
         if args.get("budget"):
             await self.set_budget(session_id, args["budget"])
+        self.snapshot_roster()
         await self.call(
             "session/rename",
             {"commandId": uuid7(), "sessionId": session_id, "name": alias},
@@ -3302,6 +3377,33 @@ async def dispatch(host: MspHost, request: dict[str, Any]) -> Any:
     command = request.get("command")
     if command == "launch":
         return await host.launch(request)
+    if command == "adopt":
+        # Re-register a live server-side session as owned WITHOUT starting
+        # a turn: restores the roster after a daemon bounce, where the
+        # in-memory ownership table is lost but sessions persist.
+        reference = request.get("session", "")
+        listed = await host.call("session/list", {"limit": 200})
+        match = None
+        for item in listed.get("sessions", []):
+            if item.get("sessionId") == reference or item.get("name") == reference:
+                match = item
+                break
+        if match is None:
+            raise ValueError(f"unknown session: {reference!r}")
+        session_id = match["sessionId"]
+        alias = request.get("name") or match.get("name") or session_id
+        host.sessions[session_id] = {
+            **match,
+            "alias": alias,
+            "lastActivity": time.time(),
+        }
+        host.aliases[alias] = session_id
+        host.refresh_budget_flag(host.sessions[session_id])
+        host.snapshot_roster()
+        host.record(
+            {"kind": "session.adopted", "sessionId": session_id, "name": alias}
+        )
+        return {"session": host.sessions[session_id]}
     if command == "send":
         return await host.submit(request["session"], request["prompt"], request.get("reasoningEffort"))
     if command == "retire":
@@ -3339,6 +3441,29 @@ async def dispatch(host: MspHost, request: dict[str, Any]) -> Any:
     if command == "pending":
         result = await host.call("approval/listPending", {"sessionId": host.resolve(request["session"])})
         return result
+    if command == "inbox":
+        # One aggregate read across owned sessions: per-lane pending
+        # approvals + user inputs. Per-session failures ride along as an
+        # inline error so one bad lane never blanks the whole inbox.
+        listed = await host.list_sessions()
+        items: list[dict[str, Any]] = []
+        for item in listed.get("sessions", []):
+            sid = item.get("sessionId")
+            if not sid:
+                continue
+            entry: dict[str, Any] = {
+                "sessionId": sid,
+                "alias": item.get("alias") or item.get("name"),
+                "status": item.get("status"),
+            }
+            try:
+                pending = await host.call("approval/listPending", {"sessionId": sid})
+                entry["approvals"] = pending.get("approvals", [])
+                entry["userInputs"] = pending.get("userInputs", [])
+            except Exception as exc:
+                entry["error"] = str(exc)
+            items.append(entry)
+        return {"inbox": items}
     if command == "health":
         try:
             limit = int(request.get("eventsLimit", 2000))
@@ -3527,7 +3652,27 @@ async def dispatch(host: MspHost, request: dict[str, Any]) -> Any:
     if command == "stop":
         host.stopping.set()
         return {"stopping": True}
+    if command == "reload":
+        # Hot upgrade: finish this response, shut down cleanly, then exec
+        # the (possibly replaced) script file fresh. New code takes effect
+        # without a manual down/up cycle. In-flight watch streams drop and
+        # the owned serve host restarts, so the roster re-resolves after
+        # the bounce per docs/heartbeat.md step 1.
+        global RELOAD_REQUESTED
+        RELOAD_REQUESTED = True
+        host.snapshot_roster()
+        host.stopping.set()
+        return {"reloading": True}
     raise ValueError(f"unknown command: {command}")
+
+
+RELOAD_REQUESTED = False
+
+
+def reload_process() -> NoReturn:
+    """Exec into a fresh daemon from the current script file on disk."""
+    script = str(Path(__file__).resolve())
+    os.execv(sys.executable, [sys.executable, script, "serve"])
 
 
 async def handle_client(host: MspHost, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -3568,6 +3713,7 @@ async def serve() -> int:
     server: asyncio.AbstractServer | None = None
     try:
         await host.start()
+        await host.restore_roster()
         server = await asyncio.start_unix_server(lambda r, w: handle_client(host, r, w), path=SOCKET)
         os.chmod(SOCKET, 0o600)
         await host.stopping.wait()
@@ -3578,6 +3724,8 @@ async def serve() -> int:
         await host.stop()
         SOCKET.unlink(missing_ok=True)
         PID_FILE.unlink(missing_ok=True)
+    if RELOAD_REQUESTED:
+        reload_process()
     return 0
 
 
@@ -3638,6 +3786,1225 @@ async def watch(after: float, limit: int) -> None:
         await writer.wait_closed()
 
 
+WEB_TOKEN_FILE = RUNTIME / "web.token"
+WEB_DEFAULT_PORT = 8765
+# Paths with no sensitive content: the static page shell only fetches,
+# so it can load before the operator pastes the token. All /api/* stay gated.
+WEB_PUBLIC_PATHS = frozenset({"/"})
+
+
+def web_ensure_token() -> str:
+    if WEB_TOKEN_FILE.exists():
+        token = WEB_TOKEN_FILE.read_text(encoding="utf-8").strip()
+        if token:
+            return token
+    token = secrets.token_urlsafe(32)
+    WEB_TOKEN_FILE.write_text(token + "\n", encoding="utf-8")
+    os.chmod(WEB_TOKEN_FILE, 0o600)
+    return token
+
+
+def web_check_token(provided: str | None, expected: str) -> bool:
+    if not provided or not expected:
+        return False
+    return secrets.compare_digest(provided, expected)
+
+
+def web_is_loopback(host: str) -> bool:
+    return host in ("127.0.0.1", "::1", "localhost")
+
+
+def web_event_allowed(record: dict[str, Any], kinds: frozenset[str]) -> bool:
+    """Server-side stream filter: match on record kind or MSP method."""
+    if not kinds:
+        return True
+    for key in ("kind", "method"):
+        value = record.get(key)
+        if isinstance(value, str) and value in kinds:
+            return True
+    return False
+
+
+def web_parse_kinds(query: dict[str, list[str]]) -> frozenset[str]:
+    raw = (query.get("kinds", [""])[0] or "")
+    return frozenset(part.strip() for part in raw.split(",") if part.strip())
+
+
+WEB_COORD_FILE = RUNTIME / "web.coordinator"
+
+
+def web_read_coordinator(path: Path = WEB_COORD_FILE) -> str | None:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def web_collect_roster(
+    host_names: list[str],
+    claims: list[dict[str, Any]],
+    intents: list[dict[str, Any]],
+) -> dict[str, list[str]]:
+    """Coordinator roster from off-serve sources. Pure: no I/O."""
+    lanes: set[str] = set()
+    now = time.time()
+    for claim in claims:
+        lane = claim.get("lane")
+        if isinstance(lane, str) and lane:
+            lanes.add(lane)
+    for record in intents:
+        message = record.get("message") if isinstance(record, dict) else None
+        if not isinstance(message, dict):
+            continue
+        # Intents are ephemeral: expired ones (smoke tests included) must
+        # not linger in the roster past their TTL.
+        expires = message.get("expiresAt")
+        if isinstance(expires, (int, float)) and expires <= now:
+            continue
+        lane = message.get("lane")
+        if isinstance(lane, str) and lane:
+            lanes.add(lane)
+    return {"hosts": sorted(set(host_names)), "lanes": sorted(lanes)}
+
+
+def web_coordinator_roster() -> dict[str, list[str]]:
+    """Roster of coordinator identities outside `muse serve`: enrolled hosts
+    plus lanes seen on the claim/intent bus. File-backed, needs no daemon."""
+    try:
+        hosts = load_hosts()
+    except (OSError, ValueError):
+        hosts = {}
+    try:
+        claims = list(claim_table().values())
+    except (OSError, ValueError):
+        claims = []
+    try:
+        intents = read_bus("m8s.intent", limit=200)
+    except (OSError, ValueError):
+        intents = []
+    return web_collect_roster(list(hosts), claims, intents)
+
+
+def web_validate_approve_payload(obj: Any) -> dict[str, Any]:
+    """Validate an approval decision. Mirrors approval/decide required
+    fields; commandId is minted by the generic `call` passthrough."""
+    if not isinstance(obj, dict):
+        raise ValueError("approve body must be a JSON object")
+    params: dict[str, Any] = {}
+    for key in ("session", "approvalId", "choiceId", "requirementId"):
+        value = obj.get(key)
+        if not value or not isinstance(value, str):
+            raise ValueError(f"approve requires a string '{key}'")
+        params[key] = value
+    feedback = obj.get("feedback")
+    if feedback is not None:
+        if not isinstance(feedback, str):
+            raise ValueError("approve feedback must be a string")
+        params["feedback"] = feedback
+    return params
+
+
+def web_validate_turn_payload(obj: Any) -> tuple[str, str, dict[str, Any] | None]:
+    """Validate a run-control action. Mirrors the `turn` CLI mapping."""
+    if not isinstance(obj, dict):
+        raise ValueError("turn body must be a JSON object")
+    session = obj.get("session")
+    action = obj.get("action")
+    if not session or not isinstance(session, str):
+        raise ValueError("turn requires a string 'session'")
+    if action not in ("steer", "cancel", "interrupt", "unqueue"):
+        raise ValueError("turn action is steer/cancel/interrupt/unqueue")
+    if action == "steer":
+        turn_id = obj.get("turnId")
+        text = obj.get("input")
+        if not turn_id or not isinstance(turn_id, str):
+            raise ValueError("turn steer requires a string 'turnId'")
+        if not text or not isinstance(text, str):
+            raise ValueError("turn steer requires a string 'input'")
+        params: dict[str, Any] = {"expectedTurnId": turn_id, "input": text}
+        if isinstance(obj.get("reasoningEffort"), str):
+            params["reasoningEffort"] = obj["reasoningEffort"]
+        return session, action, params
+    if action == "unqueue":
+        turn_id = obj.get("turnId")
+        if not turn_id or not isinstance(turn_id, str):
+            raise ValueError("turn unqueue requires a string 'turnId'")
+        return session, action, {"turnId": turn_id}
+    return session, action, None
+
+
+def web_validate_clarify_payload(obj: Any) -> dict[str, Any]:
+    if not isinstance(obj, dict):
+        raise ValueError("clarify body must be a JSON object")
+    for key in ("session", "userInputId", "text"):
+        value = obj.get(key)
+        if not value or not isinstance(value, str):
+            raise ValueError(f"clarify requires a string '{key}'")
+    if len(obj["text"]) > 500:
+        raise ValueError("clarify text is limited to 500 chars")
+    return {"session": obj["session"], "userInputId": obj["userInputId"], "text": obj["text"]}
+
+
+def web_validate_advise_payload(obj: Any) -> tuple[str, str]:
+    if not isinstance(obj, dict):
+        raise ValueError("advise body must be a JSON object")
+    coordinator = obj.get("coordinator")
+    advice = obj.get("advice")
+    if not coordinator or not isinstance(coordinator, str):
+        raise ValueError("advise requires a string 'coordinator'")
+    if not advice or not isinstance(advice, str):
+        raise ValueError("advise requires a string 'advice'")
+    return coordinator, advice
+
+
+def web_write_coordinator(session: str | None, path: Path = WEB_COORD_FILE) -> str | None:
+    """Persist the single coordinator lane. None/empty clears the selection."""
+    if session is not None and not isinstance(session, str):
+        raise ValueError("coordinator must be a session string or null")
+    cleaned = session.strip() if isinstance(session, str) else ""
+    if not cleaned:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return None
+    path.write_text(cleaned + "\n", encoding="utf-8")
+    return cleaned
+
+
+def web_sse_format(record: dict[str, Any]) -> bytes:
+    return ("data: " + json.dumps(record, separators=(",", ":")) + "\n\n").encode()
+
+
+def web_validate_send_payload(obj: Any) -> tuple[str, str]:
+    if not isinstance(obj, dict):
+        raise ValueError("send body must be a JSON object")
+    session = obj.get("session")
+    prompt = obj.get("prompt")
+    if not session or not isinstance(session, str):
+        raise ValueError("send requires a string 'session'")
+    if not prompt or not isinstance(prompt, str):
+        raise ValueError("send requires a string 'prompt'")
+    return session, prompt
+
+
+WEB_INDEX = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>m8s web (v1)</title>
+<style>
+:root{
+  color-scheme:dark;
+  --bg:#0e1116; --panel:#151b23; --line:#28303a;
+  --ink:#dbe2ea; --dim:#98a2ae;
+  --accent:#d99a2b; --accent-ink:#1a1408;
+  --ok:#3fb950; --warn:#d29922; --bad:#f85149; --info:#6aa8ff;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--bg);color:var(--ink);margin:0;padding:0 16px 40px}
+.wrap{max-width:1200px;margin:0 auto}
+header.top{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line);padding:10px 0;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+header.top h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.01em}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--dim);flex:none}
+.dot.live{background:var(--ok)}
+#auth-panel{display:flex;align-items:center;gap:8px;margin-left:auto;flex-wrap:wrap}
+main{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(min(100%,370px),1fr));margin-top:14px}
+section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px;min-width:0}
+section h2{font-size:12px;font-weight:650;letter-spacing:.06em;text-transform:uppercase;color:var(--dim);margin:0 0 10px}
+#send-panel{grid-column:1/-1}
+#inbox-panel{grid-column:1/-1}
+#board-panel{grid-column:1/-1}
+.appr{background:#0b0e12;border:1px solid var(--line);border-left:3px solid var(--bad);border-radius:6px;padding:8px 10px;margin-top:8px;font-size:13px}
+.appr.input{border-left-color:var(--info)}
+.appr .who{font-weight:650}
+.appr .tools{font-family:var(--mono);font-size:12px;color:var(--dim);margin:4px 0;overflow-wrap:anywhere}
+.appr .choices{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.appr .fb,.appr .ct{width:100%;margin-top:8px}
+.appr .q{margin:6px 0}
+.appr .err{color:var(--bad)}
+.rowline{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+input[type=text],input[type=password],select,textarea{background:#0b0e12;border:1px solid var(--line);border-radius:7px;color:var(--ink);padding:8px 10px;font-size:14px;min-height:38px}
+input[type=text],input[type=password],select{width:220px;max-width:100%}
+input:focus-visible,textarea:focus-visible,select:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+textarea{width:100%;min-height:88px;resize:vertical;font-family:var(--mono);font-size:13px}
+button{background:var(--accent);border:0;border-radius:7px;color:var(--accent-ink);font-weight:650;font-size:14px;padding:8px 14px;min-height:38px;cursor:pointer}
+button.ghost{background:transparent;border:1px solid var(--line);color:var(--ink);font-weight:500}
+button:disabled{opacity:.5;cursor:default}
+pre{background:#0b0e12;border:1px solid var(--line);border-radius:7px;padding:10px;font-family:var(--mono);font-size:12.5px;line-height:1.5;white-space:pre-wrap;word-break:break-word;max-height:320px;overflow:auto;margin:8px 0 0}
+#events{max-height:340px;overflow:auto;display:flex;flex-direction:column;gap:6px;margin-top:8px}
+#transcript{max-height:380px;overflow:auto;display:flex;flex-direction:column;gap:6px;margin-top:8px}
+.tx{background:#0b0e12;border:1px solid var(--line);border-radius:6px;padding:6px 9px;font-size:13px;line-height:1.5;overflow-wrap:anywhere}
+.tx .k{font-weight:700;margin-right:8px;font-size:11px;letter-spacing:.04em;text-transform:uppercase}
+.tx.user{border-left:3px solid var(--info)}
+.tx.tool{border-left:3px solid var(--dim);font-family:var(--mono);font-size:12px}
+.tx.tool .k{color:var(--dim)}
+.tx.sub{border-left:3px solid var(--accent)}
+.tx.turn{border-left:3px solid var(--ok)}
+.tx.dim{border-left:3px solid var(--line);color:var(--dim);font-size:12px}
+.tx .body{white-space:pre-wrap;max-height:220px;overflow:auto}
+.tx .choices{margin-top:6px}
+.diff{background:#06090d;border:1px solid var(--line);border-radius:6px;padding:8px;font-family:var(--mono);font-size:12px;line-height:1.5;white-space:pre;overflow:auto;max-height:260px;margin-top:6px}
+.diff .add{color:var(--ok)}
+.diff .del{color:var(--bad)}
+.diff .hp{color:var(--dim)}
+#tx-head{margin-top:8px}
+#tx-more{margin-top:8px}
+.ev{background:#0b0e12;border:1px solid var(--line);border-left:3px solid var(--dim);border-radius:6px;padding:6px 9px;font-family:var(--mono);font-size:12px;line-height:1.45;overflow-wrap:anywhere}
+.ev time{color:var(--dim);margin-right:8px}
+.ev .k{font-weight:700;margin-right:8px}
+.ev.stuck{border-left-color:var(--warn)} .ev.stuck .k{color:var(--warn)}
+.ev.blocked{border-left-color:var(--bad)} .ev.blocked .k{color:var(--bad)}
+.ev.turn{border-left-color:var(--ok)}
+.grp{margin-top:10px}
+.grp:first-child{margin-top:0}
+.grp>h3{font-size:11px;font-weight:650;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 6px}
+.lane{background:#0b0e12;border:1px solid var(--line);border-radius:7px;padding:8px 10px;margin-bottom:6px;font-size:14px}
+.lane .top{display:flex;gap:8px;align-items:baseline}
+.lane .nm{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
+.meter{height:5px;background:#151b23;border-radius:3px;margin-top:7px;overflow:hidden}
+.meter i{display:block;height:100%;background:var(--ok)}
+.meter i.warn{background:var(--warn)}
+.meter i.over{background:var(--bad)}
+.meter-lab{font-size:11px;color:var(--dim);margin-top:3px;font-family:var(--mono)}
+.chip{flex:none;font-size:11px;font-weight:700;letter-spacing:.04em;border-radius:20px;padding:2px 9px;text-transform:uppercase}
+.chip.run{background:rgba(63,185,80,.16);color:var(--ok)}
+.chip.idle{background:rgba(152,162,174,.16);color:var(--dim)}
+.chip.stuck{background:rgba(210,153,34,.18);color:var(--warn)}
+.chip.blocked{background:rgba(248,81,73,.16);color:var(--bad)}
+.chip.budget{background:rgba(248,81,73,.16);color:var(--bad)}
+.chip.coord{background:rgba(217,154,43,.2);color:var(--accent)}
+.mut{color:var(--dim);font-size:13px}
+#send-state,#auth-state{font-size:13px;color:var(--dim)}
+@media (max-width:640px){
+  body{padding:0 10px 28px}
+  input[type=text],input[type=password]{width:100%}
+  button{flex:1}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none !important;animation:none !important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header class="top">
+<span class="dot" id="live-dot" title="stream state"></span>
+<h1>m8s web</h1>
+<section id="auth-panel">
+<input id="token" type="password" placeholder="token" aria-label="auth token">
+<button id="save-token" class="ghost">connect</button>
+<span id="auth-state"></span>
+</section>
+</header>
+<main>
+<section id="send-panel"><h2>send advice</h2>
+<div class="rowline">
+<select id="coord-select" aria-label="coordinator lane"><option value="">coordinator: none</option></select>
+<input id="send-session" type="text" placeholder="other coordinator (default: selected)" aria-label="coordinator override">
+</div>
+<textarea id="send-prompt" placeholder="advice for the coordinator lane"></textarea>
+<div class="rowline" style="margin-top:10px;margin-bottom:0">
+<button id="send-btn">send</button>
+<span id="send-state"></span>
+</div>
+</section>
+<section id="inbox-panel"><h2>inbox — approvals &amp; input</h2>
+<div class="rowline"><button id="refresh-inbox" class="ghost">refresh</button><span class="mut" id="inbox-count"></span><span class="mut" id="inbox-age"></span></div>
+<div id="inbox"><span class="mut">not loaded</span></div>
+</section>
+<section id="board-panel"><h2>board — desired state</h2>
+<div class="rowline">
+<input id="board-repo" type="text" placeholder="OWNER/REPO" aria-label="board repo">
+<button id="refresh-board" class="ghost">reconcile</button>
+<span class="mut" id="board-age"></span>
+</div>
+<div id="board"><span class="mut">enter a repo, then reconcile</span></div>
+</section>
+<section id="lanes-panel"><h2>lanes</h2>
+<div class="rowline"><button id="refresh-lanes" class="ghost">refresh</button><span class="mut" id="lanes-count"></span><span class="mut" id="lanes-age"></span></div>
+<div id="lanes"></div></section>
+<section id="health-panel"><h2>health</h2>
+<div class="rowline"><button id="refresh-health" class="ghost">refresh</button><span class="mut" id="health-age"></span></div>
+<pre id="health">not loaded</pre></section>
+<section id="events-panel"><h2>live events</h2><span class="mut" id="events-age"></span><div id="events"></div></section>
+<section id="transcript-panel"><h2>transcript</h2>
+<div class="rowline">
+<input id="view-session" type="text" placeholder="session / lane" aria-label="session to inspect">
+<button id="read-btn" class="ghost">read</button>
+<button id="pending-btn" class="ghost">pending</button>
+</div>
+<div class="rowline" id="run-controls">
+<button id="turn-cancel" class="ghost">cancel turn</button>
+<button id="turn-interrupt" class="ghost">interrupt</button>
+<input id="steer-input" type="text" placeholder="steer the active turn…" aria-label="steer input">
+<button id="turn-steer" class="ghost">steer</button>
+<span class="mut" id="turn-state"></span>
+</div>
+<div id="tx-head" class="mut"></div>
+<div id="transcript"><span class="mut">pick a session, then read</span></div>
+<button id="tx-more" class="ghost" hidden>more</button>
+<pre id="pending">no pending check yet</pre>
+</section>
+</main>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const token = () => $("token").value.trim();
+const dot = $("live-dot");
+function headers() { return {"X-m8s-token": token(), "Content-Type": "application/json"}; }
+function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+async function get(path) {
+  const r = await fetch(path, {headers: {"X-m8s-token": token()}});
+  if (!r.ok) throw new Error("http " + r.status);
+  return await r.json();
+}
+let coordinator = null;
+function laneChips(s) {
+  const out = [];
+  const st = (s.status || "").toLowerCase();
+  out.push('<span class="chip ' + (st === "running" ? "run" : "idle") + '">' + esc(s.status || "?") + "</span>");
+  if (s.stuck) out.push('<span class="chip stuck">stuck</span>');
+  if (s.needsOwnerAction) out.push('<span class="chip blocked">blocked</span>');
+  if (s.overBudget) out.push('<span class="chip budget">budget</span>');
+  return out.join("");
+}
+async function loadCoordinator() {
+  try {
+    const data = await get("/api/coordinator");
+    coordinator = (data && data.result && data.result.coordinator) || null;
+  } catch (e) {
+    coordinator = null;
+  }
+  syncCoordSelect();
+}
+function syncCoordSelect() {
+  const sel = $("coord-select");
+  if (!sel) return;
+  if (coordinator && ![...sel.options].some((o) => o.value === coordinator)) {
+    const o = document.createElement("option");
+    o.value = coordinator; o.textContent = coordinator;
+    sel.appendChild(o);
+  }
+  sel.value = coordinator || "";
+}
+async function setCoordinator(value) {
+  const r = await fetch("/api/coordinator", {method: "POST", headers: headers(), body: JSON.stringify({session: value || null})});
+  if (!r.ok) throw new Error(await r.text());
+  coordinator = (await r.json()).result.coordinator;
+  syncCoordSelect();
+}
+async function loadCoordOptions() {
+  // Coordinators live outside `muse serve`: roster = enrolled hosts plus
+  // lanes seen on the claim/intent bus — never the served session list.
+  try {
+    const data = await get("/api/coordinators");
+    const roster = (data && data.result) || {hosts: [], lanes: []};
+    const sel = $("coord-select");
+    if (!sel) return;
+    const cur = sel.value || coordinator || "";
+    const group = (label, items) =>
+      items.length ? '<optgroup label="' + label + '">' + items.map((v) =>
+        '<option value="' + esc(v) + '">' + esc(v) + "</option>").join("") + "</optgroup>" : "";
+    sel.innerHTML = '<option value="">coordinator: none</option>'
+      + group("hosts", roster.hosts || []) + group("bus lanes", roster.lanes || []);
+    sel.value = cur;
+    syncCoordSelect();
+  } catch (e) {
+    syncCoordSelect();
+  }
+}
+const ages = {lanes: 0, health: 0, events: 0, inbox: 0, board: 0};
+const timers = {};
+const laneMap = {};
+function later(key, fn, ms) {
+  if (timers[key]) clearTimeout(timers[key]);
+  timers[key] = setTimeout(() => { delete timers[key]; fn(); }, ms);
+}
+function ago(ts) {
+  if (!ts) return "never updated";
+  const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+  if (s < 5) return "updated just now";
+  if (s < 60) return "updated " + s + "s ago";
+  return "updated " + Math.floor(s / 60) + "m ago";
+}
+function paintAges() {
+  const la = $("lanes-age"), ha = $("health-age"), ea = $("events-age"), ia = $("inbox-age"), ba = $("board-age");
+  if (la) la.textContent = ago(ages.lanes);
+  if (ha) ha.textContent = ago(ages.health);
+  if (ea) ea.textContent = ago(ages.events);
+  if (ia) ia.textContent = ago(ages.inbox);
+  if (ba) ba.textContent = ago(ages.board);
+}
+setInterval(paintAges, 5000);
+function selectedSessionId() {
+  const v = $("view-session").value.trim();
+  return laneMap[v] || v;
+}
+function eventSession(e) {
+  return e.sessionId || (e.params && e.params.sessionId) || "";
+}
+function routeEvent(e) {
+  ages.events = Date.now() / 1000; paintAges();
+  const kind = (e.kind || "") + " " + (e.method || "");
+  const sid = eventSession(e);
+  const sel = selectedSessionId();
+  const mine = !!sid && !!sel && (sid === sel || sid.slice(0, 8) === sel.slice(0, 8));
+  if (/statusChanged|tokenUsage|contextUsage/.test(kind)) later("lanes", refreshLanes, 2000);
+  if (/turn/i.test(kind)) {
+    later("lanes", refreshLanes, 2000);
+    later("health", refreshHealth, 8000);
+    if (mine) later("transcript", readTranscript, 800);
+  }
+  if (/approval|userInput|blocker/i.test(kind)) {
+    later("lanes", refreshLanes, 500);
+    later("health", refreshHealth, 2000);
+    later("inbox", refreshInbox, 1000);
+    if (mine) later("pending", readPending, 500);
+  }
+  if (/stuck|budget/i.test(kind)) {
+    later("lanes", refreshLanes, 500);
+    later("health", refreshHealth, 1000);
+  }
+  if (/HealthChanged|\bgap\b/.test(kind)) {
+    if (mine) later("transcript", readTranscript, 800);
+  }
+}
+function laneGroup(s) {
+  if (s.needsOwnerAction) return "blocked";
+  if (s.stuck) return "stuck";
+  if ((s.status || "").toLowerCase() === "running") return "running";
+  return "idle";
+}
+function budgetMeter(s) {
+  const max = s.budget && s.budget.maxTokens;
+  const used = s.tokenUsage && s.tokenUsage.totalTokens;
+  if (typeof max !== "number" || max <= 0 || typeof used !== "number") return "";
+  const pct = Math.min(100, Math.round(used / max * 100));
+  const cls = s.overBudget ? "over" : pct >= 80 ? "warn" : "";
+  return '<div class="meter" title="' + used + " / " + max + ' tokens"><i class="' + cls + '" style="width:' + pct + '%"></i></div>'
+    + '<div class="meter-lab">' + used + " / " + max + " tokens</div>";
+}
+function renderFleet(sessions) {
+  const groups = {blocked: [], stuck: [], running: [], idle: []};
+  sessions.forEach((s) => { groups[laneGroup(s)].push(s); });
+  return ["blocked", "stuck", "running", "idle"].map((g) => {
+    if (!groups[g].length) return "";
+    return '<div class="grp"><h3>' + g + " (" + groups[g].length + ")</h3>" + groups[g].map((s) =>
+      '<div class="lane"><div class="top"><span class="nm">' + esc(s.alias || s.name || s.sessionId || "?")
+      + "</span>" + laneChips(s) + "</div>" + budgetMeter(s) + "</div>"
+    ).join("") + "</div>";
+  }).join("");
+}
+async function refreshLanes() {
+  const box = $("lanes");
+  try {
+    const data = await get("/api/list");
+    const sessions = (data && data.result && data.result.sessions) || null;
+    if (!Array.isArray(sessions)) throw new Error("unexpected shape");
+    sessions.forEach((s) => {
+      const id = s.sessionId || "";
+      if (id) {
+        laneMap[id] = id;
+        if (s.alias) laneMap[s.alias] = id;
+        if (s.name) laneMap[s.name] = id;
+      }
+    });
+    $("lanes-count").textContent = sessions.length + " session" + (sessions.length === 1 ? "" : "s");
+    box.innerHTML = renderFleet(sessions) || '<span class="mut">no sessions</span>';
+    ages.lanes = Date.now() / 1000; paintAges();
+  } catch (e) {
+    box.innerHTML = '<pre>lanes failed: ' + esc(e.message) + "</pre>";
+  }
+}
+async function refreshHealth() {
+  try {
+    $("health").textContent = JSON.stringify(await get("/api/health"), null, 2);
+    ages.health = Date.now() / 1000; paintAges();
+  } catch (e) {
+    $("health").textContent = "health failed: " + e.message;
+  }
+}
+function evRow(e) {
+  const t = (typeof e.at === "number") ? new Date(e.at * 1000).toLocaleTimeString() : "--:--:--";
+  const kind = e.kind || e.method || "event";
+  let cls = "";
+  if (/stuck/i.test(kind)) cls = "stuck";
+  else if (/block|approval|inputPending/i.test(kind)) cls = "blocked";
+  else if (/turn/i.test(kind)) cls = "turn";
+  const sid = e.sessionId ? esc(String(e.sessionId).slice(0, 8)) + " " : "";
+  const detail = esc(JSON.stringify(e.params !== undefined ? e.params : e)).slice(0, 220);
+  return '<div class="ev ' + cls + '"><time>' + esc(t) + '</time><span class="k">' + esc(kind) + "</span>" + sid + detail + "</div>";
+}
+function pushEvent(raw) {
+  let e;
+  try { e = JSON.parse(raw); } catch (err) { return; }
+  const box = $("events");
+  const wrap = document.createElement("div");
+  wrap.innerHTML = evRow(e);
+  while (wrap.firstChild) box.appendChild(wrap.firstChild);
+  while (box.children.length > 200) box.removeChild(box.firstChild);
+  box.scrollTop = box.scrollHeight;
+  routeEvent(e);
+}
+async function refreshEvents() {
+  $("events").innerHTML = "";
+  try {
+    const evts = await get("/api/events?limit=50");
+    const list = (evts && evts.result && evts.result.events) || evts.events || [];
+    list.forEach((e) => pushEvent(JSON.stringify(e)));
+    ages.events = Date.now() / 1000; paintAges();
+  } catch (e) {
+    $("events").innerHTML = '<span class="mut">events failed: ' + esc(e.message) + "</span>";
+  }
+}
+let txSession = "", txCursor = null, activeTurn = null;
+function txText(s, max) {
+  const t = String(s === undefined || s === null ? "" : s);
+  return esc(t.length > max ? t.slice(0, max) + "…" : t);
+}
+function txRow(e) {
+  const m = e.method || "", p = e.params || {}, it = (p.item && typeof p.item === "object") ? p.item : {};
+  if (m === "turn/started") return '<div class="tx turn"><span class="k">turn</span>started</div>';
+  if (m === "turn/completed")
+    return '<div class="tx turn"><span class="k">turn</span>' + esc(p.status || it.status || "done") + "</div>";
+  if (it.kind === "userMessage")
+    return '<div class="tx user"><span class="k">you</span><div class="body">' + txText(it.text, 2000) + "</div></div>";
+  if (it.kind === "toolCall") {
+    const args = typeof it.args === "string" ? it.args : JSON.stringify(it.args);
+    const out = it.visibleOutput ? '<div class="body">' + txText(it.visibleOutput, 600) + "</div>" : "";
+    let extra = "";
+    if (it.patchSummary) {
+      const ps = it.patchSummary;
+      extra = ' <span class="chip idle">' + ps.files + " file" + (ps.files === 1 ? "" : "s")
+        + " +" + ps.added + "/-" + ps.removed + "</span>";
+    }
+    const diffBtn = (it.patchRef && it.patchRef.id)
+      ? '<div class="choices"><button class="ghost" data-diff="1" data-item="' + esc(it.itemId)
+        + '" data-ref="' + esc(it.patchRef.id) + '">diff</button></div><div class="diffbox"></div>'
+      : "";
+    return '<div class="tx tool"><span class="k">' + esc(it.tool || "tool") + "</span>" + esc(it.status || "")
+      + extra + '<div class="body">' + txText(args, 500) + "</div>" + out + diffBtn + "</div>";
+  }
+  if (it.kind === "reminderChild")
+    return '<div class="tx sub"><span class="k">subagent</span>' + txText(it.fallbackText || it.taskId, 400) + "</div>";
+  if (/tokenUsage|todoListChanged/.test(m))
+    return '<div class="tx dim">' + esc(m.split("/")[1] || m) + "</div>";
+  return '<div class="tx dim"><span class="k">' + esc(m) + "</span></div>";
+}
+async function readTranscript(more) {
+  const s = $("view-session").value.trim();
+  if (!s) return;
+  if (!more || s !== txSession) {
+    txSession = s; txCursor = null; activeTurn = null;
+    $("transcript").innerHTML = "";
+  }
+  try {
+    const hdr = await get("/api/read?session=" + encodeURIComponent(s));
+    const sess = hdr && hdr.result && hdr.result.session;
+    if (sess) {
+      activeTurn = sess.activeTurnId || null;
+      $("tx-head").textContent = (sess.branch || "") + " · " + (sess.modelId || "") + " · " + (sess.status || "")
+        + (activeTurn ? " · turn " + String(activeTurn).slice(0, 8) : "");
+    }
+    const url = "/api/view?session=" + encodeURIComponent(s) + "&limit=50"
+      + (txCursor ? "&cursor=" + encodeURIComponent(txCursor) : "");
+    const data = await get(url);
+    const res = (data && data.result) || {};
+    const box = $("transcript");
+    const wrap = document.createElement("div");
+    wrap.innerHTML = (res.events || []).map(txRow).join("");
+    while (wrap.firstChild) box.appendChild(wrap.firstChild);
+    txCursor = res.nextCursor || null;
+    $("tx-more").hidden = !txCursor;
+    if (!more) box.scrollTop = box.scrollHeight;
+  } catch (e) {
+    $("transcript").innerHTML = '<span class="mut">read failed: ' + esc(e.message) + "</span>";
+  }
+}
+async function toggleDiff(btn) {
+  const holder = btn.closest(".tx").querySelector(".diffbox");
+  if (holder.innerHTML) { holder.innerHTML = ""; btn.textContent = "diff"; return; }
+  btn.disabled = true;
+  try {
+    const data = await get("/api/patch?session=" + encodeURIComponent(txSession)
+      + "&itemId=" + encodeURIComponent(btn.dataset.item) + "&ref=" + encodeURIComponent(btn.dataset.ref));
+    const content = JSON.parse(((data && data.result) || {}).content || "{}");
+    holder.innerHTML = (content.files || []).map((f) =>
+      '<div class="diff"><div class="hp">' + esc(f.path || "") + "</div>" + (f.hunks || []).map((h) =>
+        (h.lines || []).map((ln) => {
+          const cls = ln[0] === "+" ? "add" : ln[0] === "-" ? "del" : "";
+          return '<div class="' + cls + '">' + esc(ln).slice(0, 400) + "</div>";
+        }).join("")
+      ).join("") + "</div>"
+    ).join("") || '<span class="mut">empty patch</span>';
+    btn.textContent = "hide";
+  } catch (e) {
+    holder.innerHTML = '<span class="mut">diff failed: ' + esc(e.message) + "</span>";
+  }
+  btn.disabled = false;
+}
+async function turnOp(action, extra) {
+  const s = txSession || $("view-session").value.trim();
+  if (!s) return;
+  const body = Object.assign({session: s, action}, extra || {});
+  $("turn-state").textContent = action + "…";
+  try {
+    const r = await fetch("/api/turn", {method: "POST", headers: headers(), body: JSON.stringify(body)});
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    if (!data.ok) throw new Error((data.error || "daemon refused").slice(0, 120));
+    $("turn-state").textContent = action + " ok";
+    refreshLanes(); readTranscript();
+  } catch (e) {
+    $("turn-state").textContent = action + " failed: " + String(e.message).slice(0, 120);
+  }
+}
+async function readPending() {
+  const s = $("view-session").value.trim();
+  if (!s) return;
+  try {
+    $("pending").textContent = JSON.stringify(await get("/api/pending?session=" + encodeURIComponent(s)), null, 2);
+  } catch (e) {
+    $("pending").textContent = "pending failed: " + e.message;
+  }
+}
+function reqStr(v) { return typeof v === "string" ? v : JSON.stringify(v); }
+async function refreshInbox() {
+  const box = $("inbox");
+  try {
+    const data = await get("/api/inbox");
+    const items = (data && data.result && data.result.inbox) || null;
+    if (!Array.isArray(items)) throw new Error("unexpected shape");
+    let n = 0;
+    box.innerHTML = items.map((entry) => {
+      const who = esc(entry.alias || entry.sessionId || "?");
+      const sid = entry.sessionId || "";
+      let html = "";
+      if (entry.error)
+        html += '<div class="appr"><span class="who">' + who + '</span> <span class="err">' + esc(entry.error) + "</span></div>";
+      (entry.approvals || []).forEach((a) => { n++; html += approvalRow(who, sid, a); });
+      (entry.userInputs || []).forEach((u) => { n++; html += inputRow(who, sid, u); });
+      return html;
+    }).join("") || '<span class="mut">nothing pending</span>';
+    $("inbox-count").textContent = n ? n + " waiting" : "";
+    ages.inbox = Date.now() / 1000; paintAges();
+  } catch (e) {
+    box.innerHTML = '<span class="mut">inbox failed: ' + esc(e.message) + "</span>";
+  }
+}
+function approvalRow(who, sid, a) {
+  const subj = a.subject || a.toolName || "approval";
+  const args = (a.rawArgs || "").slice(0, 300);
+  const req = reqStr(a.currentRequirementId);
+  const choices = (a.availableChoices || []).map((c) =>
+    '<button class="ghost" data-approve="1" data-sid="' + esc(sid) + '" data-aid="' + esc(a.approvalId)
+    + '" data-cid="' + esc(c.choiceId) + '" data-req="' + esc(req) + '">' + esc(c.label || c.choiceId) + "</button>"
+  ).join("");
+  const fb = (a.availableChoices || []).some((c) => c.acceptsFeedback)
+    ? '<input class="fb" type="text" placeholder="feedback for the model (optional, sent with denial)" aria-label="denial feedback">'
+    : "";
+  const prot = a.protectedWrite ? ' <span class="chip blocked">protected write</span>' : "";
+  return '<div class="appr"><span class="who">' + who + "</span> needs a decision" + prot
+    + '<div class="tools">' + esc(subj) + (args ? " " + esc(args) : "") + "</div>" + fb
+    + '<div class="choices">' + (choices || '<span class="mut">no choices offered</span>') + "</div></div>";
+}
+function inputRow(who, sid, u) {
+  const qs = (u.questions || []).map((q) =>
+    '<div class="q">' + esc(q.question || q.prompt || JSON.stringify(q)).slice(0, 300) + "</div>").join("");
+  return '<div class="appr input"><span class="who">' + who + "</span> asks"
+    + '<div class="tools">' + esc(u.toolName || "input") + "</div>" + qs
+    + '<textarea class="ct" placeholder="clarification for the model (max 500 chars)"></textarea>'
+    + '<div class="choices"><button class="ghost" data-clarify="1" data-sid="' + esc(sid)
+    + '" data-uid="' + esc(u.userInputId) + '">send clarification</button></div></div>';
+}
+async function decide(btn) {
+  const fbEl = btn.closest(".appr").querySelector(".fb");
+  const body = {session: btn.dataset.sid, approvalId: btn.dataset.aid, choiceId: btn.dataset.cid, requirementId: btn.dataset.req};
+  if (fbEl && fbEl.value.trim()) body.feedback = fbEl.value.trim();
+  btn.disabled = true;
+  try {
+    const r = await fetch("/api/approve", {method: "POST", headers: headers(), body: JSON.stringify(body)});
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    if (!data.ok) throw new Error((data.error || "daemon refused").slice(0, 120));
+    refreshInbox(); refreshLanes();
+  } catch (e) {
+    btn.disabled = false;
+    $("inbox-count").textContent = "decision failed: " + String(e.message).slice(0, 120);
+  }
+}
+async function clarify(btn) {
+  const ta = btn.closest(".appr").querySelector(".ct");
+  const text = ((ta && ta.value) || "").trim();
+  if (!text) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch("/api/clarify", {method: "POST", headers: headers(), body: JSON.stringify({session: btn.dataset.sid, userInputId: btn.dataset.uid, text})});
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    if (!data.ok) throw new Error((data.error || "daemon refused").slice(0, 120));
+    refreshInbox();
+  } catch (e) {
+    btn.disabled = false;
+    $("inbox-count").textContent = "clarify failed: " + String(e.message).slice(0, 120);
+  }
+}
+function boardChip(a) {
+  const cls = {"propose": "coord", "requeue": "stuck", "queued": "idle", "in-sync": "idle", "page-human": "blocked", "attention": "blocked"}[a.action] || "idle";
+  return '<span class="chip ' + cls + '">' + esc(a.action || "item") + "</span>";
+}
+function tagAttention(list) {
+  return list.map((a) => (typeof a === "string") ? a : Object.assign({action: "attention"}, a));
+}
+function boardRow(a) {
+  if (typeof a === "string") a = {branch: a};
+  const sess = a.sessionId ? "session " + String(a.sessionId).slice(0, 8) : "";
+  const title = ((a.issue !== undefined && a.issue !== null) ? "#" + a.issue + " " : "")
+    + (a.lane || a.branch || sess || a.summary || a.kind || "item");
+  return '<div class="lane"><div class="top"><span class="nm">' + esc(title) + "</span>" + boardChip(a) + "</div>"
+    + (a.reason ? '<div class="meter-lab">' + esc(a.reason).slice(0, 300) + "</div>" : "")
+    + (a.decisionClass ? '<div class="meter-lab">decision: ' + esc(a.decisionClass) + "</div>" : "") + "</div>";
+}
+async function refreshBoard() {
+  const repo = $("board-repo").value.trim();
+  if (!repo) {
+    $("board").innerHTML = '<span class="mut">enter OWNER/REPO first</span>';
+    return;
+  }
+  localStorage.setItem("m8s-board-repo", repo);
+  $("board").innerHTML = '<span class="mut">reconciling ' + esc(repo) + "…</span>";
+  try {
+    const data = await get("/api/board?repo=" + encodeURIComponent(repo));
+    const plan = (data && data.result) || {};
+    const by = {"propose": [], "requeue": [], "queued": [], "in-sync": [], "page-human": []};
+    (plan.actions || []).forEach((a) => { (by[a.action] || (by[a.action] = [])).push(a); });
+    const grp = (title, list) => (list && list.length)
+      ? '<div class="grp"><h3>' + title + " (" + list.length + ")</h3>" + list.map(boardRow).join("") + "</div>" : "";
+    const needYou = tagAttention([...(by["page-human"] || []), ...(plan.attention || [])]);
+    $("board").innerHTML =
+      grp("needs you", needYou) + grp("propose", by.propose) + grp("requeue", plan.requeue || [])
+      + grp("queued", by.queued) + grp("in sync", by["in-sync"])
+      || '<span class="mut">empty plan</span>';
+    ages.board = Date.now() / 1000; paintAges();
+  } catch (e) {
+    $("board").innerHTML = '<span class="mut">board failed: ' + esc(e.message) + "</span>";
+  }
+}
+async function sendAdvice() {
+  // Coordinators are outside `muse serve`: advice travels as an intent-bus
+  // message (verb "advise"), never a turn submit. The override box takes
+  // another coordinator identity, not a served session.
+  const target = $("send-session").value.trim() || coordinator || "";
+  const advice = $("send-prompt").value;
+  const btn = $("send-btn");
+  if (!target) {
+    $("send-state").textContent = "pick a coordinator above or type one";
+    return;
+  }
+  if (!advice.trim()) {
+    $("send-state").textContent = "write the advice first";
+    return;
+  }
+  btn.disabled = true;
+  $("send-state").textContent = "publishing intent...";
+  try {
+    const r = await fetch("/api/advise", {method: "POST", headers: headers(), body: JSON.stringify({coordinator: target, advice})});
+    $("send-state").textContent = r.ok ? "intent published" : ("failed: " + await r.text());
+    if (r.ok) $("send-prompt").value = "";
+  } catch (e) {
+    $("send-state").textContent = "failed: " + e.message;
+  }
+  btn.disabled = false;
+}
+function setLive(on) { if (dot) dot.classList.toggle("live", !!on); }
+function stream() {
+  const src = new EventSource("/api/events/stream?token=" + encodeURIComponent(token()));
+  src.onopen = () => setLive(true);
+  src.onerror = () => setLive(false);
+  src.onmessage = (m) => { setLive(true); pushEvent(m.data); };
+  return src;
+}
+let src = null;
+function connect() {
+  $("auth-state").textContent = "connected";
+  if (src) src.close();
+  src = stream();
+  loadCoordinator().then(() => { loadCoordOptions(); });
+  refreshLanes(); refreshHealth(); refreshEvents(); refreshInbox();
+}
+$("refresh-lanes").onclick = refreshLanes;
+$("refresh-health").onclick = refreshHealth;
+$("refresh-inbox").onclick = refreshInbox;
+$("refresh-board").onclick = refreshBoard;
+$("board-repo").value = localStorage.getItem("m8s-board-repo") || "";
+$("read-btn").onclick = () => readTranscript(false);
+$("tx-more").onclick = () => readTranscript(true);
+$("pending-btn").onclick = readPending;
+$("transcript").addEventListener("click", (ev) => {
+  const t = ev.target.closest("[data-diff]");
+  if (!t || t.disabled) return;
+  toggleDiff(t);
+});
+$("turn-cancel").onclick = () => turnOp("cancel");
+$("turn-interrupt").onclick = () => turnOp("interrupt");
+$("turn-steer").onclick = () => {
+  const text = $("steer-input").value.trim();
+  if (!text) return;
+  if (!activeTurn) {
+    $("turn-state").textContent = "no active turn to steer";
+    return;
+  }
+  turnOp("steer", {turnId: activeTurn, input: text});
+  $("steer-input").value = "";
+};
+$("send-btn").onclick = sendAdvice;
+$("inbox").addEventListener("click", (ev) => {
+  const t = ev.target.closest("[data-approve],[data-clarify]");
+  if (!t || t.disabled) return;
+  if (t.dataset.approve) decide(t); else clarify(t);
+});
+$("coord-select").onchange = async () => {
+  try {
+    await setCoordinator($("coord-select").value);
+    $("send-state").textContent = "";
+  } catch (e) {
+    $("send-state").textContent = "coordinator failed: " + e.message;
+  }
+};
+$("save-token").onclick = () => {
+  localStorage.setItem("m8s-token", token());
+  connect();
+};
+$("token").value = localStorage.getItem("m8s-token") || "";
+if ($("token").value) { connect(); }
+
+</script>
+</body>
+</html>
+"""
+
+
+class WebHandler(http.server.BaseHTTPRequestHandler):
+    expected_token: str = ""
+    server_version = "m8s-web/1"
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        sys.stderr.write("web %s\n" % (fmt % args))
+
+    def _provided_token(self, query: dict[str, list[str]]) -> str | None:
+        header = self.headers.get("X-m8s-token")
+        if header:
+            return header.strip()
+        values = query.get("token")
+        if values:
+            return values[0]
+        return None
+
+    def _authorized(self, query: dict[str, list[str]]) -> bool:
+        return web_check_token(self._provided_token(query), self.expected_token)
+
+    def _json(self, status: int, obj: Any) -> None:
+        body = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _proxy(self, request: dict[str, Any]) -> Any:
+        return asyncio.run(client(request))
+
+    def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler naming)
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        if parsed.path == "/":
+            body = WEB_INDEX.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if parsed.path == "/api/events/stream":
+            if not self._authorized(query):
+                self._json(401, {"ok": False, "error": "unauthorized"})
+                return
+            try:
+                after = float(query.get("after", ["0"])[0])
+            except ValueError:
+                after = 0.0
+            kinds = web_parse_kinds(query)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            try:
+                for record in read_events(after, 200):
+                    if not web_event_allowed(record, kinds):
+                        continue
+                    after = max(after, float(record.get("at", after)))
+                    self.wfile.write(web_sse_format(record))
+                self.wfile.flush()
+                # Poll the shared events file; the web process is separate
+                # from the daemon so it cannot join host.watchers directly.
+                for _ in range(60):
+                    time.sleep(1)
+                    fresh = [r for r in read_events(after, 200) if web_event_allowed(r, kinds)]
+                    for record in fresh:
+                        after = max(after, float(record.get("at", after)))
+                        self.wfile.write(web_sse_format(record))
+                    if fresh:
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        if not self._authorized(query):
+            self._json(401, {"ok": False, "error": "unauthorized"})
+            return
+        try:
+            if parsed.path == "/api/list":
+                self._json(200, self._proxy({"command": "list"}))
+            elif parsed.path == "/api/health":
+                try:
+                    limit = int(query.get("eventsLimit", ["2000"])[0])
+                except ValueError:
+                    limit = 2000
+                self._json(200, self._proxy({"command": "health", "eventsLimit": limit}))
+            elif parsed.path == "/api/events":
+                try:
+                    after = float(query.get("after", ["0"])[0])
+                except ValueError:
+                    after = 0.0
+                try:
+                    limit = int(query.get("limit", ["200"])[0])
+                except ValueError:
+                    limit = 200
+                kinds = web_parse_kinds(query)
+                events = [r for r in read_events(after, limit) if web_event_allowed(r, kinds)]
+                self._json(200, {"ok": True, "result": {"events": events}})
+            elif parsed.path == "/api/pending":
+                session = (query.get("session", [""])[0] or "").strip()
+                if not session:
+                    self._json(400, {"ok": False, "error": "pending requires ?session="})
+                else:
+                    self._json(200, self._proxy({"command": "pending", "session": session}))
+            elif parsed.path == "/api/read":
+                session = (query.get("session", [""])[0] or "").strip()
+                if not session:
+                    self._json(400, {"ok": False, "error": "read requires ?session="})
+                else:
+                    self._json(200, self._proxy(call_request("session/read", session)))
+            elif parsed.path == "/api/coordinator":
+                self._json(200, {"ok": True, "result": {"coordinator": web_read_coordinator()}})
+            elif parsed.path == "/api/coordinators":
+                self._json(200, {"ok": True, "result": web_coordinator_roster()})
+            elif parsed.path == "/api/inbox":
+                self._json(200, self._proxy({"command": "inbox"}))
+            elif parsed.path == "/api/board":
+                # Desired-state view: read-only gh export + reconcile, all
+                # daemonless and file-backed, so the bridge runs it directly.
+                repo = (query.get("repo", [""])[0] or "").strip()
+                if not repo or "/" not in repo:
+                    self._json(
+                        400, {"ok": False, "error": "board requires ?repo=OWNER/REPO"}
+                    )
+                else:
+                    try:
+                        limit = int(query.get("limit", ["100"])[0])
+                    except ValueError:
+                        limit = 100
+                    try:
+                        events_limit = int(query.get("eventsLimit", ["200"])[0])
+                    except ValueError:
+                        events_limit = 200
+                    try:
+                        snapshot = export_board_snapshot(repo, limit=limit)
+                        try:
+                            claims = claim_table()
+                        except (OSError, ValueError):
+                            claims = {}
+                        plan = board_reconcile(
+                            snapshot, claims, read_events(0, events_limit)
+                        )
+                    except Exception as exc:
+                        self._json(502, {"ok": False, "error": str(exc)[:300]})
+                    else:
+                        self._json(200, {"ok": True, "result": plan})
+            elif parsed.path == "/api/patch":
+                item_id = (query.get("itemId", [""])[0] or "").strip()
+                ref = (query.get("ref", [""])[0] or "").strip()
+                session = (query.get("session", [""])[0] or "").strip()
+                if not session or not item_id or not ref:
+                    self._json(
+                        400,
+                        {"ok": False, "error": "patch requires ?session=&itemId=&ref="},
+                    )
+                else:
+                    try:
+                        offset = int(query.get("offset", ["0"])[0])
+                    except ValueError:
+                        offset = 0
+                    self._json(
+                        200,
+                        self._proxy(
+                            call_request(
+                                "item/readOutput",
+                                session,
+                                {
+                                    "itemId": item_id,
+                                    "outputRef": ref,
+                                    "offsetBytes": offset,
+                                },
+                            )
+                        ),
+                    )
+            elif parsed.path == "/api/view":
+                session = (query.get("session", [""])[0] or "").strip()
+                if not session:
+                    self._json(400, {"ok": False, "error": "view requires ?session="})
+                else:
+                    params: dict[str, Any] = {"limit": int(query.get("limit", ["50"])[0])}
+                    if query.get("cursor"):
+                        params["cursor"] = query["cursor"][0]
+                    self._json(200, self._proxy(call_request("view/page", session, params)))
+            else:
+                self._json(404, {"ok": False, "error": f"unknown path: {parsed.path}"})
+        except Exception as exc:
+            self._json(502, {"ok": False, "error": str(exc)})
+
+    def do_POST(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler naming)
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        if not self._authorized(query):
+            self._json(401, {"ok": False, "error": "unauthorized"})
+            return
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        raw = self.rfile.read(length) if length > 0 else b"{}"
+        try:
+            obj = json.loads(raw.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            self._json(400, {"ok": False, "error": "invalid JSON body"})
+            return
+        try:
+            if parsed.path == "/api/send":
+                session, prompt = web_validate_send_payload(obj)
+                req: dict[str, Any] = {"command": "send", "session": session, "prompt": prompt}
+                if isinstance(obj.get("reasoningEffort"), str):
+                    req["reasoningEffort"] = obj["reasoningEffort"]
+                self._json(200, self._proxy(req))
+            elif parsed.path == "/api/coordinator":
+                if not isinstance(obj, dict) or ("session" in obj and not isinstance(obj["session"], (str, type(None)))):
+                    self._json(400, {"ok": False, "error": "coordinator body is {session: string|null}"})
+                else:
+                    try:
+                        value = web_write_coordinator(obj.get("session"))
+                    except ValueError as exc:
+                        self._json(400, {"ok": False, "error": str(exc)})
+                    else:
+                        self._json(200, {"ok": True, "result": {"coordinator": value}})
+            elif parsed.path == "/api/approve":
+                # Human-in-the-loop decision: the click IS the authorization.
+                # requirementId guards the multi-stage race server-side; a
+                # stale decision fails there, never silently applies.
+                try:
+                    params = web_validate_approve_payload(obj)
+                except ValueError as exc:
+                    self._json(400, {"ok": False, "error": str(exc)})
+                else:
+                    session = params.pop("session")
+                    self._json(
+                        200, self._proxy(call_request("approval/decide", session, params))
+                    )
+            elif parsed.path == "/api/clarify":
+                try:
+                    params = web_validate_clarify_payload(obj)
+                except ValueError as exc:
+                    self._json(400, {"ok": False, "error": str(exc)})
+                else:
+                    session = params.pop("session")
+                    self._json(
+                        200,
+                        self._proxy(
+                            call_request(
+                                "userInput/clarify",
+                                session,
+                                {
+                                    "userInputId": params["userInputId"],
+                                    "clarification": {
+                                        "format": "text",
+                                        "content": params["text"],
+                                    },
+                                },
+                            )
+                        ),
+                    )
+            elif parsed.path == "/api/turn":
+                # Run controls: user-driven steering of a live lane. cancel
+                # and interrupt act on the active turn; steer/unqueue name it.
+                try:
+                    session, action, params = web_validate_turn_payload(obj)
+                except ValueError as exc:
+                    self._json(400, {"ok": False, "error": str(exc)})
+                else:
+                    self._json(
+                        200, self._proxy(call_request(f"turn/{action}", session, params))
+                    )
+            elif parsed.path == "/api/advise":
+                # Advice to an off-serve coordinator goes on the intent bus
+                # (verb "advise"), the sanctioned cross-node channel — never
+                # a turn submit, since coordinators are not served sessions.
+                try:
+                    target, advice = web_validate_advise_payload(obj)
+                except ValueError as exc:
+                    self._json(400, {"ok": False, "error": str(exc)})
+                else:
+                    try:
+                        self._json(
+                            200,
+                            self._proxy(
+                                {
+                                    "command": "bus",
+                                    "action": "intent",
+                                    "verb": "advise",
+                                    "lane": target,
+                                    "detail": advice,
+                                }
+                            ),
+                        )
+                    except Exception as exc:
+                        self._json(502, {"ok": False, "error": str(exc)})
+            else:
+                self._json(404, {"ok": False, "error": f"unknown path: {parsed.path}"})
+        except ValueError as exc:
+            self._json(400, {"ok": False, "error": str(exc)})
+        except Exception as exc:
+            self._json(502, {"ok": False, "error": str(exc)})
+
+
+def web_check_bind(bind: str, allow_remote: bool = False) -> None:
+    if not web_is_loopback(bind) and not allow_remote:
+        raise SystemExit(
+            f"web refuses non-loopback bind {bind!r}: pass --allow-remote to expose it"
+        )
+
+
+def run_web(bind: str, port: int, allow_remote: bool = False) -> int:
+    web_check_bind(bind, allow_remote)
+    token = web_ensure_token()
+    WebHandler.expected_token = token
+    server = http.server.ThreadingHTTPServer((bind, port), WebHandler)
+    print(f"m8s web v1 on http://{bind}:{port}/ (token saved to {WEB_TOKEN_FILE})")
+    print("pass it as X-m8s-token header or ?token= for the event stream")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -3645,6 +5012,10 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("serve", help=argparse.SUPPRESS)
     sub.add_parser("up", help="start the MSP controller daemon")
     sub.add_parser("down", help="stop the MSP controller daemon")
+    sub.add_parser(
+        "reload",
+        help="hot-upgrade the daemon: clean shutdown then exec the script file fresh",
+    )
     sub.add_parser("list", help="list owned sessions with budget, usage, and stuck flags")
     events = sub.add_parser("events", help="read summarized MSP events")
     events.add_argument("--after", type=float, default=0)
@@ -3670,6 +5041,12 @@ def parser() -> argparse.ArgumentParser:
     send.add_argument("session")
     send.add_argument("prompt")
     send.add_argument("--reasoning-effort")
+    adopt = sub.add_parser(
+        "adopt",
+        help="re-register a live server-side session as owned without starting a turn (post-bounce roster repair)",
+    )
+    adopt.add_argument("session", help="session id or server-side name")
+    adopt.add_argument("--name", help="alias to register (default: server-side name)")
     pending = sub.add_parser("pending", help="list pending approvals and user input")
     pending.add_argument("session")
     retire = sub.add_parser(
@@ -3698,6 +5075,7 @@ def parser() -> argparse.ArgumentParser:
         default=None,
         help="attributed operator recorded on the event (default: this agent)",
     )
+    sub.add_parser("inbox", help="pending approvals and user input across all owned sessions")
     health_cmd = sub.add_parser(
         "health", help="fused swarm health screen: liveness, turns, progress, down/stuck/blocked"
     )
@@ -3876,6 +5254,14 @@ def parser() -> argparse.ArgumentParser:
     set_approval = sub.add_parser("set-approval-mode", help="set approval mode (session/setApprovalMode)")
     set_approval.add_argument("session")
     set_approval.add_argument("mode")
+    web = sub.add_parser("web", help="serve the v1 web client (loopback by default, token-gated)")
+    web.add_argument("--bind", default="127.0.0.1", help="bind address (loopback unless --allow-remote)")
+    web.add_argument("--port", type=int, default=WEB_DEFAULT_PORT, help="port to listen on")
+    web.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="permit a non-loopback bind (e.g. a Tailscale IP); still token-gated",
+    )
     return p
 
 
@@ -3899,6 +5285,8 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
     command = args.command
     if command == "down":
         return {"command": "stop"}
+    if command == "reload":
+        return {"command": "reload"}
     if command == "list":
         return {"command": "list"}
     if command == "events":
@@ -3933,6 +5321,11 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
             "prompt": args.prompt,
             "reasoningEffort": args.reasoning_effort,
         }
+    if command == "adopt":
+        request = {"command": "adopt", "session": args.session}
+        if args.name:
+            request["name"] = args.name
+        return request
     if command == "pending":
         return {"command": "pending", "session": args.session}
     if command == "retire":
@@ -3944,6 +5337,8 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
             "reason": args.reason,
             "by": args.by,
         }
+    if command == "inbox":
+        return {"command": "inbox"}
     if command == "health":
         return {"command": "health", "eventsLimit": args.events_limit}
     if command == "host":
@@ -4132,6 +5527,8 @@ def main() -> int:
         return 0
     if args.command == "up":
         result = start_daemon()
+    elif args.command == "web":
+        return run_web(args.bind, args.port, args.allow_remote)
     else:
         if not daemon_running():
             raise SystemExit("Muse MSP controller is not running; run `muse-msp.py up`")

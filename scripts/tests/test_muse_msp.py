@@ -145,6 +145,143 @@ class DispatchTest(unittest.TestCase):
         host, _ = self.run_call({"method": "skill/list", "session": "lane"})
         self.assertEqual(host.calls[0], ("skill/list", {"sessionId": "session-1"}))
 
+    def test_reload_request_builds(self) -> None:
+        self.assertEqual(
+            muse_msp.build_request(parse(["reload"])), {"command": "reload"}
+        )
+
+    def test_adopt_request_builds(self) -> None:
+        self.assertEqual(
+            muse_msp.build_request(parse(["adopt", "lane-9"])),
+            {"command": "adopt", "session": "lane-9"},
+        )
+        self.assertEqual(
+            muse_msp.build_request(parse(["adopt", "s9", "--name", "lane-9"])),
+            {"command": "adopt", "session": "s9", "name": "lane-9"},
+        )
+
+    def test_adopt_registers_live_session_without_turn(self) -> None:
+        import tempfile
+        from unittest import mock
+
+        class AdoptHost(FakeHost):
+            async def call(self, method: str, params: dict | None = None):
+                assert method == "session/list"
+                return {
+                    "sessions": [
+                        {"sessionId": "s9", "name": "lane-9", "status": "idle"}
+                    ]
+                }
+
+        async def go(host, request):
+            return await muse_msp.dispatch(host, request)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(
+                muse_msp, "SESSIONS_FILE", Path(tmp) / "sessions.json"
+            ):
+                host = AdoptHost()
+                host.sessions = {}
+                host.aliases = {}
+                result = asyncio.run(go(host, {"command": "adopt", "session": "lane-9"}))
+                with self.assertRaises(ValueError):
+                    asyncio.run(go(AdoptHost(), {"command": "adopt", "session": "nope"}))
+        self.assertEqual(result["session"]["alias"], "lane-9")
+        self.assertEqual(result["session"]["sessionId"], "s9")
+        self.assertEqual(host.aliases["lane-9"], "s9")
+
+    def test_reload_flags_stop_and_responds(self) -> None:
+        import tempfile
+        from unittest import mock
+
+        async def go():
+            host = FakeHost()
+            host.stopping = asyncio.Event()
+            host.sessions = {}
+            host.aliases = {}
+            return await muse_msp.dispatch(host, {"command": "reload"}), host
+
+        saved = muse_msp.RELOAD_REQUESTED
+        muse_msp.RELOAD_REQUESTED = False
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with mock.patch.object(
+                    muse_msp, "SESSIONS_FILE", Path(tmp) / "sessions.json"
+                ):
+                    result, host = asyncio.run(go())
+                    fired = muse_msp.RELOAD_REQUESTED
+        finally:
+            muse_msp.RELOAD_REQUESTED = saved
+        self.assertEqual(result, {"reloading": True})
+        self.assertTrue(host.stopping.is_set())
+        self.assertTrue(fired)
+
+    def test_roster_roundtrip(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sessions.json"
+            sessions = {"s1": {"sessionId": "s1", "alias": "lane-1"}}
+            aliases = {"lane-1": "s1"}
+            muse_msp.save_roster(sessions, aliases, path)
+            self.assertEqual(muse_msp.load_roster(path), (sessions, aliases))
+
+    def test_roster_missing_or_corrupt_is_empty(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "nope.json"
+            self.assertEqual(muse_msp.load_roster(missing), ({}, {}))
+            bad = Path(tmp) / "bad.json"
+            bad.write_text("not json{", encoding="utf-8")
+            self.assertEqual(muse_msp.load_roster(bad), ({}, {}))
+
+    def test_restore_keeps_live_drops_dead(self) -> None:
+        import tempfile
+
+        class RestoreHost(FakeHost):
+            async def call(self, method: str, params: dict | None = None):
+                assert method == "session/list"
+                return {"sessions": [{"sessionId": "live"}]}
+
+        async def go(path):
+            host = RestoreHost()
+            host.sessions = {}
+            host.aliases = {}
+            result = await host.restore_roster(path)
+            return host, result
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sessions.json"
+            muse_msp.save_roster(
+                {
+                    "live": {"sessionId": "live", "alias": "lane-live"},
+                    "dead": {"sessionId": "dead", "alias": "lane-dead"},
+                },
+                {"lane-live": "live", "lane-dead": "dead"},
+                path,
+            )
+            host, result = asyncio.run(go(path))
+        self.assertEqual(result, {"restored": 1, "dropped": 1})
+        self.assertIn("live", host.sessions)
+        self.assertNotIn("dead", host.sessions)
+        self.assertEqual(host.aliases, {"lane-live": "live"})
+
+    def test_reload_process_execs_current_script(self) -> None:
+        from unittest import mock
+
+        with mock.patch.object(muse_msp.os, "execv") as execv:
+            try:
+                muse_msp.reload_process()
+            except Exception:
+                pass
+        execv.assert_called_once()
+        argv = execv.call_args[0]
+        self.assertEqual(argv[0], muse_msp.sys.executable)
+        self.assertEqual(
+            argv[1], [muse_msp.sys.executable, str(SCRIPT.resolve()), "serve"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
