@@ -2156,6 +2156,88 @@ class MspHost:
             owned.append(merged)
         return {"sessions": owned}
 
+    async def health(self, events_limit: int = 2000) -> dict[str, Any]:
+        """Fuse one swarm health screen (issue #11).
+
+        Reuses `list_sessions` (P2 stuck/budget flags plus the P4 lease
+        on each row — no second ownership system) and the `events` log,
+        then adds per-member pending approvals/inputs plus worktree
+        progress (git branch-ahead, read-only `gh` PR checks). One bad
+        lane never sinks the screen: per-member MSP/git/gh failures
+        degrade that member's cells to unknown.
+        """
+        listed = await self.list_sessions()
+        items = listed.get("sessions", [])
+        # P4 lease state rides along, same shape as `list`: the live
+        # lease (if any) on each owned session.
+        live_by_session = {
+            claim.get("sessionId"): claim
+            for claim in claim_table().values()
+            if claim.get("live") and claim.get("sessionId")
+        }
+        events = read_events(0.0, max(1, int(events_limit)))
+        blockers: dict[str, list[dict[str, Any]]] = {}
+        for record in events:
+            if isinstance(record, dict) and record.get("kind") == "blocker":
+                sid = event_session(record)
+                if sid is not None:
+                    blockers.setdefault(sid, []).append(record)
+        inputs: list[dict[str, Any]] = []
+        pending_by: dict[str, dict[str, int]] = {}
+        progress_by: dict[str, dict[str, Any]] = {}
+        for item in items:
+            sid = str(item.get("sessionId") or "")
+            state = self.sessions.get(sid, {})
+            entry = dict(item)
+            entry.setdefault("lastRepoActivity", state.get("lastRepoActivity"))
+            lease = live_by_session.get(sid)
+            if lease is not None:
+                entry["lease"] = {
+                    "host": lease.get("host"),
+                    "lane": lease.get("lane"),
+                    "branch": lease.get("branch"),
+                    "checkout": lease.get("checkout"),
+                    "expiresAt": lease.get("expiresAt"),
+                }
+            inputs.append(entry)
+            try:
+                pending_result = await self.call(
+                    "approval/listPending", {"sessionId": sid}
+                )
+            except Exception:
+                pending_result = {}
+            counts = pending_counts(
+                pending_result, item.get("attention"), blockers.get(sid, [])
+            )
+            pending_by[sid] = counts
+            workspace = item.get("workspace") or state.get("workspace")
+            try:
+                progress = await asyncio.to_thread(
+                    health_progress_for_workspace, workspace
+                )
+            except Exception:
+                progress = {"branch": None, "ahead": None}
+            if progress.get("branch"):
+                try:
+                    pr = await asyncio.to_thread(
+                        health_pr_for_branch, progress["branch"], workspace
+                    )
+                except Exception:
+                    pr = None
+                if pr is not None:
+                    progress["pr"] = pr
+            progress["pending"] = counts
+            progress_by[sid] = progress
+        return fuse_health(
+            inputs,
+            events,
+            pending_by,
+            progress_by,
+            time.time(),
+            stuck_after_seconds(),
+            down_after_seconds(),
+        )
+
     async def set_budget(self, reference: str, spec: dict[str, Any]) -> dict[str, Any]:
         session_id = self.resolve(reference)
         budget = normalize_budget(spec)
@@ -2272,6 +2354,394 @@ def summarize_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+# ---------------------------------------------------------------------------
+# Moonshot P2+: `m8s health` — fused swarm health screen (issue #11).
+#
+# One screen for the whole swarm. Per member it fuses liveness (`list`
+# status + last-event age from `events`), responsiveness (recent turn
+# activity), and progress (branch-ahead commits, open-PR check state,
+# pending approvals/inputs). Exactly three flags exist — `down` (listed
+# but unresponsive), `stuck` (running with no events and no commits),
+# `blocked` (waiting on approval/user input) — and nothing else is a
+# flag: unflagged members render as `-`. P2 stuck/budget surfacing is
+# reused (lane_stuck, overBudget) and P4 lease state rides along on each
+# row; neither is regressed. `gh` is read-only (pr list); any git/gh
+# failure degrades that cell to unknown, never the screen.
+# ---------------------------------------------------------------------------
+
+# Long-silence horizon for `down`. A listed lane with no events for this
+# long is unresponsive rather than merely stuck. Overridable via
+# M8S_DOWN_AFTER_SECONDS; invalid values fall back to the default.
+DOWN_AFTER_SECONDS = 2 * 60 * 60
+
+# The only health flags. Priority on a member is blocked > down > stuck:
+# a lane awaiting input is blocked even when silent, and long silence is
+# down (cannot confirm it is running) rather than stuck.
+HEALTH_FLAGS = ("down", "stuck", "blocked")
+
+# Event kinds that count as turn activity (responsiveness).
+TURN_EVENT_KINDS = frozenset({"turn.submitted", "lane.attention"})
+
+
+def down_after_seconds() -> int:
+    try:
+        return max(1, int(os.environ.get("M8S_DOWN_AFTER_SECONDS", DOWN_AFTER_SECONDS)))
+    except (TypeError, ValueError):
+        return DOWN_AFTER_SECONDS
+
+
+def event_session(record: dict[str, Any]) -> str | None:
+    """Owning session of an event record.
+
+    Daemon-local records carry `sessionId` at top level; served MSP
+    frames are wrapped as `msp.event` with the id inside `params`.
+    Returns None for swarm-wide records with no owner.
+    """
+    sid = record.get("sessionId")
+    if isinstance(sid, str) and sid:
+        return sid
+    params = record.get("params")
+    if isinstance(params, dict):
+        sid = params.get("sessionId")
+        if isinstance(sid, str) and sid:
+            return sid
+    return None
+
+
+def is_turn_event(record: dict[str, Any]) -> bool:
+    """Whether an event record signals turn activity (responsiveness)."""
+    if record.get("kind") in TURN_EVENT_KINDS:
+        return True
+    if record.get("kind") == "msp.event":
+        method = record.get("method")
+        return isinstance(method, str) and method.startswith("turn/")
+    return False
+
+
+def pending_counts(
+    result: Any,
+    attention: Any,
+    blocker_events: list[dict[str, Any]] | None = None,
+) -> dict[str, int]:
+    """Fuse pending approvals/inputs from every honest signal.
+
+    `result` is the raw `approval/listPending` reply (whose exact shape
+    is server-defined, so list-valued fields are counted defensively);
+    `attention` is the live `session/statusChanged` attention array;
+    `blocker_events` are unresolved approval/user-input request records.
+    Never raises — unparseable inputs count as zero for that signal.
+    """
+    approvals = 0
+    inputs = 0
+    if isinstance(result, dict):
+        for key, value in result.items():
+            if not isinstance(value, list):
+                continue
+            lowered = str(key).lower()
+            if any(hint in lowered for hint in ("input", "question")):
+                inputs = max(inputs, len(value))
+            else:
+                approvals = max(approvals, len(value))
+    try:
+        names = [str(entry).lower() for entry in (attention or [])]
+    except TypeError:
+        names = []
+    if any("approval" in name for name in names):
+        approvals = max(approvals, 1)
+    if any("input" in name or "question" in name for name in names):
+        inputs = max(inputs, 1)
+    for record in blocker_events or []:
+        if not isinstance(record, dict):
+            continue
+        reason = str(record.get("reason") or "")
+        if reason.startswith("approval"):
+            approvals += 1
+        elif reason.startswith("userInput"):
+            inputs += 1
+    return {"approvals": approvals, "inputs": inputs}
+
+
+def pr_check_state(rollup: Any) -> str | None:
+    """Map a `gh` statusCheckRollup to passing/pending/failing.
+
+    None (no PR, or gh unavailable) stays None (unknown); an empty
+    rollup means no checks have reported yet, i.e. pending.
+    """
+    if rollup is None:
+        return None
+    if not isinstance(rollup, list) or not rollup:
+        return "pending"
+    worst = "passing"
+    seen = False
+    for check in rollup:
+        if not isinstance(check, dict):
+            continue
+        seen = True
+        value = str(
+            check.get("conclusion")
+            or check.get("status")
+            or check.get("state")
+            or ""
+        ).upper()
+        if value in ("FAILURE", "FAILED", "ERROR", "TIMED_OUT"):
+            return "failing"
+        if value in ("SUCCESS", "SUCCEEDED", "SKIPPED", "NEUTRAL"):
+            continue
+        worst = "pending"
+    return worst if seen else "pending"
+
+
+def health_progress_for_workspace(
+    workspace: str | None, run: Any = None
+) -> dict[str, Any]:
+    """Branch + ahead-count for a lane worktree (never raises).
+
+    `ahead` counts commits on HEAD past `@{upstream}`; it is None when
+    the worktree has no determinable upstream. `run` injects the
+    subprocess runner (tests); default is `subprocess.run`.
+    """
+    progress: dict[str, Any] = {"branch": None, "ahead": None}
+    if not workspace:
+        return progress
+    runner = run or subprocess.run
+
+    def git(*argv: str) -> str:
+        proc = runner(
+            ["git", "-C", str(workspace), *argv],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            raise OSError(f"git {' '.join(argv)} failed")
+        return (proc.stdout or "").strip()
+
+    try:
+        branch = git("rev-parse", "--abbrev-ref", "HEAD")
+        if branch and branch != "HEAD":
+            progress["branch"] = branch
+        try:
+            progress["ahead"] = int(git("rev-list", "--count", "@{upstream}..HEAD"))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            progress["ahead"] = None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return progress
+
+
+def health_pr_for_branch(
+    branch: str | None, workspace: str | None = None, run: Any = None
+) -> dict[str, Any] | None:
+    """Open-PR check state for a lane branch via read-only `gh` (never raises).
+
+    Returns {"number", "url", "checks"} or None when there is no open PR
+    or `gh` is unavailable/fails. Never writes to GitHub — the
+    coordinator owns board writes. `run` injects the runner (tests).
+    """
+    if not branch:
+        return None
+    runner = run or subprocess.run
+    try:
+        proc = runner(
+            [
+                "gh", "pr", "list",
+                "--head", branch,
+                "--limit", "1",
+                "--json", "number,url,statusCheckRollup",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=str(workspace) if workspace else None,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        entries = json.loads(proc.stdout or "null")
+    except ValueError:
+        return None
+    if not isinstance(entries, list) or not entries:
+        return None
+    entry = entries[0]
+    if not isinstance(entry, dict):
+        return None
+    return {
+        "number": entry.get("number"),
+        "url": entry.get("url"),
+        "checks": pr_check_state(entry.get("statusCheckRollup")),
+    }
+
+
+def fuse_health(
+    sessions: list[dict[str, Any]],
+    events: list[dict[str, Any]] | None = None,
+    pending_by_session: dict[str, dict[str, int]] | None = None,
+    progress_by_session: dict[str, dict[str, Any]] | None = None,
+    now: float | None = None,
+    stuck_after: int | None = None,
+    down_after: int | None = None,
+) -> dict[str, Any]:
+    """Fuse liveness + responsiveness + progress into one swarm report (pure).
+
+    `sessions` are `list`-style member states; `events` the `events`-style
+    log; `pending_by_session` maps sessionId to pending_counts-style
+    {"approvals", "inputs"}; `progress_by_session` maps sessionId to
+    {"branch", "ahead", "pr"}. Members sort by alias/sessionId for a
+    stable order. Each row carries exactly one of flag None/"down"/
+    "stuck"/"blocked" with blocked > down > stuck priority: pending
+    input wins over silence; long silence is down; otherwise P2
+    lane_stuck (idle on events AND commits, or a dead turn awaiting
+    owner action) is stuck.
+    """
+    at = time.time() if now is None else now
+    s_after = STUCK_IDLE_SECONDS if stuck_after is None else stuck_after
+    d_after = DOWN_AFTER_SECONDS if down_after is None else down_after
+    pending_by_session = pending_by_session or {}
+    progress_by_session = progress_by_session or {}
+    last_event: dict[str, float] = {}
+    last_turn: dict[str, float] = {}
+    turns_recent: dict[str, int] = {}
+    for record in events or []:
+        if not isinstance(record, dict):
+            continue
+        sid = event_session(record)
+        if sid is None:
+            continue
+        ts = record.get("at")
+        if not isinstance(ts, (int, float)):
+            continue
+        if ts > last_event.get(sid, float("-inf")):
+            last_event[sid] = ts
+        if is_turn_event(record):
+            if ts > last_turn.get(sid, float("-inf")):
+                last_turn[sid] = ts
+            if ts > at - s_after:
+                turns_recent[sid] = turns_recent.get(sid, 0) + 1
+    members: list[dict[str, Any]] = []
+    counts = {"down": 0, "stuck": 0, "blocked": 0}
+    ordered = sorted(sessions, key=lambda s: str(s.get("alias") or s.get("sessionId") or ""))
+    for state in ordered:
+        sid = str(state.get("sessionId") or "")
+        name = str(state.get("alias") or sid)
+        event_at = last_event.get(sid)
+        event_age = (at - event_at) if event_at is not None else None
+        turn_at = last_turn.get(sid)
+        pending = dict(pending_by_session.get(sid) or {"approvals": 0, "inputs": 0})
+        try:
+            names = [str(entry).lower() for entry in (state.get("attention") or [])]
+        except TypeError:
+            names = []
+        if any("approval" in name for name in names):
+            pending["approvals"] = max(int(pending.get("approvals", 0)), 1)
+        if any("input" in name or "question" in name for name in names):
+            pending["inputs"] = max(int(pending.get("inputs", 0)), 1)
+        stuck = lane_stuck(state, at, s_after)
+        flag: str | None = None
+        if int(pending.get("approvals", 0)) + int(pending.get("inputs", 0)) > 0:
+            flag = "blocked"
+        elif event_at is None or (event_age is not None and event_age >= d_after):
+            flag = "down"
+        elif stuck is not None:
+            flag = "stuck"
+        if flag is not None:
+            counts[flag] += 1
+        progress = progress_by_session.get(sid) or {}
+        members.append(
+            {
+                "member": name,
+                "sessionId": sid,
+                "status": state.get("status"),
+                "lastEventAgeSeconds": event_age,
+                "turnsRecent": turns_recent.get(sid, 0),
+                "lastTurnAgeSeconds": (at - turn_at) if turn_at is not None else None,
+                "branch": progress.get("branch"),
+                "ahead": progress.get("ahead"),
+                "pr": progress.get("pr"),
+                "pending": {
+                    "approvals": int(pending.get("approvals", 0)),
+                    "inputs": int(pending.get("inputs", 0)),
+                },
+                "lease": state.get("lease"),
+                "overBudget": bool(state.get("overBudget")),
+                "stuck": stuck,
+                "flag": flag,
+            }
+        )
+    return {
+        "members": members,
+        "summary": {"total": len(members), **counts},
+    }
+
+
+def health_age(seconds: Any) -> str:
+    """Compact age cell: 12s / 3m / 2h / 5d, `-` when unknown."""
+    if not isinstance(seconds, (int, float)):
+        return "-"
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        return f"{total // 60}m"
+    if total < 86400:
+        return f"{total // 3600}h"
+    return f"{total // 86400}d"
+
+
+def format_health(report: dict[str, Any], now: float | None = None) -> str:
+    """Render the fused report as one deterministic screen (pure).
+
+    Stable member order (fusion order), one row per member, plus a
+    flags summary line. The only flag words that ever appear are
+    down/stuck/blocked; unflagged members show `-`.
+    """
+    del now  # Screens carry precomputed ages; rendering adds no clock reads.
+    members = report.get("members") or []
+    summary = report.get("summary") or {}
+    total = int(summary.get("total", len(members)))
+    noun = "member" if total == 1 else "members"
+    lines = [f"m8s health: {total} {noun}"]
+    if not members:
+        lines.append("(swarm empty)")
+    else:
+        width = max(len(str(member.get("member", ""))) for member in members)
+        lines.append(f"{'MEMBER'.ljust(width)}  {'LIVE':<16}  {'TURNS':<18}  PROGRESS  FLAG")
+        for member in members:
+            status = member.get("status") or "unknown"
+            live = f"{status} ev {health_age(member.get('lastEventAgeSeconds'))}"
+            turns = (
+                f"{int(member.get('turnsRecent', 0))} "
+                f"(last {health_age(member.get('lastTurnAgeSeconds'))})"
+            )
+            parts: list[str] = []
+            branch = member.get("branch")
+            if branch:
+                ahead = member.get("ahead")
+                parts.append(f"{branch}+{ahead}" if isinstance(ahead, int) else str(branch))
+            pr = member.get("pr") or {}
+            if pr.get("number") is not None:
+                parts.append(f"#{pr['number']}/{pr.get('checks') or '?'}")
+            pending = member.get("pending") or {}
+            if int(pending.get("approvals", 0)):
+                parts.append(f"approvals:{pending['approvals']}")
+            if int(pending.get("inputs", 0)):
+                parts.append(f"inputs:{pending['inputs']}")
+            progress = " ".join(parts) if parts else "-"
+            flag = member.get("flag") or "-"
+            lines.append(
+                f"{str(member.get('member', '')).ljust(width)}  "
+                f"{live:<16}  {turns:<18}  {progress}  {flag}"
+            )
+    lines.append(
+        f"summary: {total} {noun} - "
+        f"down: {int(summary.get('down', 0))}, "
+        f"stuck: {int(summary.get('stuck', 0))}, "
+        f"blocked: {int(summary.get('blocked', 0))}"
+    )
+    return "\n".join(lines)
+
+
 def read_events(after: float = 0.0, limit: int = 200) -> list[dict[str, Any]]:
     if not EVENTS.exists():
         return []
@@ -2320,6 +2790,12 @@ async def dispatch(host: MspHost, request: dict[str, Any]) -> Any:
     if command == "pending":
         result = await host.call("approval/listPending", {"sessionId": host.resolve(request["session"])})
         return result
+    if command == "health":
+        try:
+            limit = int(request.get("eventsLimit", 2000))
+        except (TypeError, ValueError):
+            limit = 2000
+        return await host.health(limit)
     if command == "call":
         params = dict(request.get("params") or {})
         if request.get("session"):
@@ -2647,6 +3123,13 @@ def parser() -> argparse.ArgumentParser:
     send.add_argument("--reasoning-effort")
     pending = sub.add_parser("pending", help="list pending approvals and user input")
     pending.add_argument("session")
+    health_cmd = sub.add_parser(
+        "health", help="fused swarm health screen: liveness, turns, progress, down/stuck/blocked"
+    )
+    health_cmd.add_argument("--json", action="store_true", help="print the raw fusion report as JSON")
+    health_cmd.add_argument(
+        "--events-limit", type=int, default=2000, help="recent events to scan (default 2000)"
+    )
 
     budget = sub.add_parser("budget", help="show or set a lane's token/context/model budget")
     budget.add_argument("session")
@@ -2856,6 +3339,8 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
         }
     if command == "pending":
         return {"command": "pending", "session": args.session}
+    if command == "health":
+        return {"command": "health", "eventsLimit": args.events_limit}
     if command == "host":
         request: dict[str, Any] = {"command": "host", "action": args.action}
         if args.name:
@@ -3052,6 +3537,9 @@ def main() -> int:
                 pass
             return 0
         result = asyncio.run(client(build_request(args)))
+    if args.command == "health" and not args.json and result.get("ok", True):
+        print(format_health(result.get("result", {})))
+        return 0
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result.get("ok", True) else 1
 
