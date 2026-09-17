@@ -38,6 +38,19 @@ cumulative total is also included as `tokenUsage` in `list` for sessions that
 have emitted usage since the controller started. `usage/changed` concerns the
 provider subscription window, not a session's token count.
 
+Per-lane budgets (`budget SESSION [--max-tokens N] [--max-context-tokens N]
+[--models a,b]`, or `launch` with the same flags) cap cumulative tokens,
+context occupancy, and allowed models. `list` shows each lane's `budget`,
+`tokenUsage`, `overBudget`, `needsOwnerAction`, and `stuck` flags; breaching
+lanes refuse new turns with a typed `overBudget` error until the budget is
+raised, and every breach records a `budget.exceeded` event marked
+`decisionClass: spend`. Stuck lanes (no transcript/repo activity past
+`M8S_STUCK_AFTER_SECONDS`, default 30 minutes, or a failed/cancelled turn with
+no owner action) appear as `stuck` in `list` with one `lane.stuck` event each.
+The generic `call` passthrough validates the method against the exported MSP
+schema before hitting the wire: unknown methods and missing-but-required
+`commandId` values fail client-side with a typed `errorKind`.
+
 Treat these as actionable:
 
 - `session/statusChanged` with `approvalPending` or `inputPending`;

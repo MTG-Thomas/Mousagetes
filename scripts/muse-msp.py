@@ -42,6 +42,67 @@ DAEMON_LOG = RUNTIME / "daemon.log"
 MSP_STREAM_LIMIT = 16 * 1024 * 1024
 
 
+# All 51 MSP methods on the experimental surface (exported via
+# `muse schema generate-json-schema --out DIR --experimental`; the method
+# index plus the parity gate's deferral register is the authoritative list).
+# The generic `call` surface validates against this snapshot before hitting
+# the wire so typos fail fast instead of as daemon round-trip failures.
+MSP_METHODS = frozenset(
+    {
+        "account/loginCancel",
+        "account/loginStart",
+        "account/logout",
+        "account/read",
+        "approval/decide",
+        "approval/listPending",
+        "goal/clear",
+        "goal/edit",
+        "goal/pause",
+        "goal/resume",
+        "goal/set",
+        "initialize",
+        "item/readOutput",
+        "model/list",
+        "session/compact",
+        "session/fork",
+        "session/list",
+        "session/read",
+        "session/rename",
+        "session/resume",
+        "session/setApprovalMode",
+        "session/setModel",
+        "session/setReasoningEffort",
+        "session/start",
+        "session/userShell",
+        "skill/list",
+        "subagent/close",
+        "subagent/followupTask",
+        "subagent/interrupt",
+        "subagent/readResult",
+        "subagent/reopen",
+        "subagent/resume",
+        "subagent/sendMessage",
+        "subagent/stop",
+        "task/background",
+        "task/stop",
+        "task/stopAll",
+        "turn/cancel",
+        "turn/interrupt",
+        "turn/start",
+        "turn/steer",
+        "turn/unqueue",
+        "usage/read",
+        "userInput/answer",
+        "userInput/cancel",
+        "userInput/clarify",
+        "view/page",
+        "view/subscribe",
+        "view/unsubscribe",
+        "workflow/cancel",
+        "workflow/childControl",
+    }
+)
+
 # Methods whose params require a client-minted commandId (per the MSP schema's
 # required lists). The generic `call` surface injects one automatically.
 COMMAND_METHODS = frozenset(
@@ -87,7 +148,7 @@ COMMAND_METHODS = frozenset(
 )
 
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 def uuid7() -> str:
@@ -108,6 +169,217 @@ def emit_local(record: dict[str, Any]) -> dict[str, Any]:
     return record
 
 
+BUDGETS_FILE = RUNTIME / "budgets.json"
+
+# Spend is a paged decision-class event (moonshot stewardship): budget breach
+# records carry this marker so supervisors page instead of scrolling past.
+SPEND_DECISION_CLASS = "spend"
+
+# Idle threshold for stuck-lane detection. Overridable for tests and hosts via
+# M8S_STUCK_AFTER_SECONDS; invalid values fall back to the default.
+STUCK_IDLE_SECONDS = 30 * 60
+
+
+def stuck_after_seconds() -> int:
+    try:
+        return max(1, int(os.environ.get("M8S_STUCK_AFTER_SECONDS", STUCK_IDLE_SECONDS)))
+    except (TypeError, ValueError):
+        return STUCK_IDLE_SECONDS
+
+
+def load_budgets() -> dict[str, dict[str, Any]]:
+    try:
+        raw = json.loads(BUDGETS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def save_budgets(budgets: dict[str, dict[str, Any]]) -> None:
+    BUDGETS_FILE.write_text(json.dumps(budgets, sort_keys=True), encoding="utf-8")
+
+
+def normalize_budget(spec: dict[str, Any]) -> dict[str, Any]:
+    """Coerce a lane budget to {maxTokens?, maxContextTokens?, models?}.
+
+    Raises ValueError on non-positive caps, empty model lists, or unknown
+    keys so misconfiguration fails fast instead of silently not enforcing.
+    """
+    allowed = {"maxTokens", "maxContextTokens", "models"}
+    unknown = set(spec) - allowed
+    if unknown:
+        raise ValueError(f"unknown budget keys: {sorted(unknown)}")
+    budget: dict[str, Any] = {}
+    for key in ("maxTokens", "maxContextTokens"):
+        value = spec.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"budget {key} must be a positive integer")
+        budget[key] = value
+    models = spec.get("models")
+    if models is not None:
+        if isinstance(models, str):
+            models = [m.strip() for m in models.split(",")]
+        if (
+            not isinstance(models, list)
+            or not models
+            or any(not isinstance(m, str) or not m for m in models)
+        ):
+            raise ValueError("budget models must be a non-empty list of model ids")
+        budget["models"] = list(models)
+    if not budget:
+        raise ValueError("budget needs at least one of maxTokens, maxContextTokens, models")
+    return budget
+
+
+def usage_total(token_usage: Any) -> int | None:
+    """Latest cumulative token total, or None when no usage was reported."""
+    if isinstance(token_usage, dict):
+        total = token_usage.get("totalTokens")
+        return total if isinstance(total, int) else None
+    return token_usage if isinstance(token_usage, int) else None
+
+
+def budget_breach(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the breached budget limit for a lane state, if any.
+
+    Pure check over the lane's configured budget plus its latest reported
+    token/context usage and model. Returns {"limit": ...} or None.
+    """
+    budget = state.get("budget") or {}
+    if not budget:
+        return None
+    total = usage_total(state.get("tokenUsage"))
+    if (
+        budget.get("maxTokens") is not None
+        and total is not None
+        and total >= budget["maxTokens"]
+    ):
+        return {"limit": "maxTokens", "total": total, "cap": budget["maxTokens"]}
+    context = state.get("contextUsage") or {}
+    used = context.get("usedTokens")
+    if (
+        budget.get("maxContextTokens") is not None
+        and isinstance(used, int)
+        and used >= budget["maxContextTokens"]
+    ):
+        return {"limit": "maxContextTokens", "total": used, "cap": budget["maxContextTokens"]}
+    models = budget.get("models")
+    if models and state.get("modelId") and state["modelId"] not in models:
+        return {"limit": "models", "model": state["modelId"], "allowed": models}
+    return None
+
+
+def lane_stuck(state: dict[str, Any], now: float, after: int | None = None) -> dict[str, Any] | None:
+    """Flag a stuck lane: failed/cancelled turn awaiting owner action, or no
+    transcript/repo activity past the threshold.
+
+    Pure check returning {"reason": ...} or None. Lanes never observed
+    (no lastActivity) are not stuck — avoids flagging fresh or foreign lanes.
+    """
+    limit = STUCK_IDLE_SECONDS if after is None else after
+    if state.get("needsOwnerAction"):
+        terminal = state.get("lastTerminal", "failed")
+        return {"reason": f"turn{str(terminal).capitalize()}", "needsOwnerAction": True}
+    candidates = [state.get("lastActivity"), state.get("lastRepoActivity")]
+    latest = max((t for t in candidates if isinstance(t, (int, float))), default=None)
+    if latest is None:
+        return None
+    idle = now - latest
+    if idle >= limit:
+        return {"reason": "idle", "idleForSeconds": idle}
+    return None
+
+
+def repo_activity_ts(workspace: str | None) -> float | None:
+    """Cheapest honest repo-activity signal: newest mtime of the worktree's
+    git HEAD/branch ref (commits, checkouts). Returns None when unknown —
+    callers then judge by transcript activity alone. Never raises."""
+    if not workspace:
+        return None
+    try:
+        workdir = Path(workspace)
+        if not workdir.is_dir():
+            return None
+        proc = subprocess.run(
+            ["git", "-C", str(workdir), "rev-parse", "--git-dir"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            return None
+        git_dir = Path(proc.stdout.strip())
+        if not git_dir.is_absolute():
+            git_dir = workdir / git_dir
+        stamps: list[float] = []
+        for ref in (git_dir / "HEAD", git_dir / "refs"):
+            try:
+                if ref.is_file():
+                    stamps.append(ref.stat().st_mtime)
+                elif ref.is_dir():
+                    newest = max(
+                        (p.stat().st_mtime for p in ref.rglob("*") if p.is_file()),
+                        default=None,
+                    )
+                    if newest is not None:
+                        stamps.append(newest)
+            except OSError:
+                continue
+        return max(stamps) if stamps else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+class CallValidationError(ValueError):
+    """Typed client-side error for the generic `call` passthrough.
+
+    Raised before any wire round-trip. ``kind`` is machine-readable:
+    "unknownMethod" or "missingCommandId".
+    """
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+class BudgetExceededError(ValueError):
+    """Typed enforcement error: the lane is over budget and paused.
+
+    ``kind`` is "overBudget" (token/context cap hit) or "modelNotAllowed"
+    (model outside the lane's allowlist).
+    """
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+def validate_call(
+    method: str,
+    params: dict[str, Any] | None = None,
+    command_id: str = "auto",
+) -> None:
+    """Validate generic-passthrough params against the exported MSP schema.
+
+    Raises CallValidationError for an unknown method, or when the method
+    requires a commandId and the caller disabled minting without supplying
+    one. Pure check: performs no I/O.
+    """
+    if method not in MSP_METHODS:
+        raise CallValidationError("unknownMethod", f"unknown MSP method: {method}")
+    if (
+        command_id == "off"
+        and method in COMMAND_METHODS
+        and not (params or {}).get("commandId")
+    ):
+        raise CallValidationError(
+            "missingCommandId",
+            f"MSP method {method} requires commandId; pass --command-id, not 'off'",
+        )
+
+
 class MspHost:
     def __init__(self) -> None:
         self.proc: asyncio.subprocess.Process | None = None
@@ -117,6 +389,7 @@ class MspHost:
         self.aliases: dict[str, str] = {}
         self.watchers: set[asyncio.StreamWriter] = set()
         self.stopping = asyncio.Event()
+        self.budgets: dict[str, dict[str, Any]] = load_budgets()
 
     def record(self, record: dict[str, Any]) -> None:
         saved = emit_local(record)
@@ -156,7 +429,7 @@ class MspHost:
                 "clientInfo": {
                     "name": "codex_muse_supervisor",
                     "title": "Codex Muse supervisor",
-                    "version": "0.1.0",
+                    "version": "0.2.0",
                 },
                 "capabilities": {
                     "experimentalApi": True,
@@ -255,10 +528,43 @@ class MspHost:
             }
         )
 
+    def refresh_budget_flag(self, state: dict[str, Any]) -> None:
+        """Reconcile the lane's over-budget flag without raising.
+
+        Breaches record a spend decision-class event (paged, never buried);
+        a raised budget clears the flag with a matching event.
+        """
+        breach = budget_breach(state)
+        session_id = state.get("sessionId")
+        if breach and not state.get("overBudget"):
+            state["overBudget"] = True
+            state["overBudgetLimit"] = breach["limit"]
+            self.record(
+                {
+                    "kind": "budget.exceeded",
+                    "decisionClass": SPEND_DECISION_CLASS,
+                    "sessionId": session_id,
+                    "limit": breach["limit"],
+                    "detail": breach,
+                    "summary": f"lane over budget ({breach['limit']}): spend decision required",
+                }
+            )
+        elif not breach and state.get("overBudget"):
+            state["overBudget"] = False
+            state.pop("overBudgetLimit", None)
+            self.record(
+                {
+                    "kind": "budget.cleared",
+                    "decisionClass": SPEND_DECISION_CLASS,
+                    "sessionId": session_id,
+                }
+            )
+
     async def _notification(self, method: str, params: dict[str, Any]) -> None:
         session_id = params.get("sessionId")
         if session_id:
             state = self.sessions.setdefault(session_id, {"sessionId": session_id})
+            state["lastActivity"] = time.time()
             if "viewCursor" in params:
                 state["viewCursor"] = params["viewCursor"]
             if method == "session/statusChanged":
@@ -266,9 +572,37 @@ class MspHost:
                 state["attention"] = params.get("attention", [])
             elif method == "session/tokenUsage":
                 state["tokenUsage"] = params.get("cumulative")
+                self.refresh_budget_flag(state)
+            elif method == "session/contextUsage":
+                state["contextUsage"] = {
+                    "usedTokens": params.get("usedTokens"),
+                    "windowTokens": params.get("windowTokens"),
+                    "pressure": params.get("pressure"),
+                }
+                self.refresh_budget_flag(state)
+            elif method == "session/modelChanged":
+                if params.get("modelId"):
+                    state["modelId"] = params["modelId"]
+                self.refresh_budget_flag(state)
+            elif method == "turn/completed":
+                terminal = params.get("terminal")
+                state["lastTerminal"] = terminal
+                if terminal in ("failed", "cancelled"):
+                    state["needsOwnerAction"] = True
+                    self.record(
+                        {
+                            "kind": "lane.attention",
+                            "sessionId": session_id,
+                            "turnId": params.get("turnId"),
+                            "reason": f"turn{str(terminal).capitalize()}",
+                            "summary": f"turn {terminal} with no owner action yet",
+                        }
+                    )
         interesting = {
             "session/statusChanged",
             "session/tokenUsage",
+            "session/contextUsage",
+            "session/modelChanged",
             "turn/completed",
             "turn/retryScheduled",
             "view/gap",
@@ -301,8 +635,16 @@ class MspHost:
         )
         session = started["session"]
         session_id = session["sessionId"]
-        self.sessions[session_id] = {**session, "viewCursor": started["viewCursor"], "alias": alias}
+        self.sessions[session_id] = {
+            **session,
+            "viewCursor": started["viewCursor"],
+            "alias": alias,
+            "workspace": workspace,
+            "lastActivity": time.time(),
+        }
         self.aliases[alias] = session_id
+        if args.get("budget"):
+            await self.set_budget(session_id, args["budget"])
         await self.call(
             "session/rename",
             {"commandId": uuid7(), "sessionId": session_id, "name": alias},
@@ -311,8 +653,26 @@ class MspHost:
         self.record({"kind": "session.launched", "sessionId": session_id, "name": alias, "workspace": workspace})
         return {"session": self.sessions[session_id], "turn": turn}
 
+    def enforce_budget(self, session_id: str) -> None:
+        """Pause over-budget lanes: refuse new work with a typed error.
+
+        Reconciles the flag first so a freshly raised budget unpauses the
+        lane without waiting for the next usage event.
+        """
+        state = self.sessions.get(session_id)
+        if state is None:
+            return
+        self.refresh_budget_flag(state)
+        breach = budget_breach(state)
+        if breach:
+            raise BudgetExceededError(
+                "overBudget",
+                f"lane over budget ({breach['limit']}): raise the budget before sending more work",
+            )
+
     async def submit(self, reference: str, prompt: str, reasoning: str | None = None) -> dict[str, Any]:
         session_id = self.resolve(reference)
+        self.enforce_budget(session_id)
         params: dict[str, Any] = {
             "commandId": uuid7(),
             "sessionId": session_id,
@@ -323,16 +683,103 @@ class MspHost:
         if reasoning:
             params["reasoningEffort"] = reasoning
         result = await self.call("turn/start", params)
+        self.owner_acted(session_id)
         self.record({"kind": "turn.submitted", "sessionId": session_id, "turnId": result.get("turnId")})
         return result
 
+    def owner_acted(self, session_id: str) -> None:
+        """Record an owner action: clears stuck/attention flags for the lane."""
+        state = self.sessions.get(session_id)
+        if state is None:
+            return
+        state["lastActivity"] = time.time()
+        state["needsOwnerAction"] = False
+        state.pop("lastTerminal", None)
+        state.pop("stuckFlagged", None)
+
     async def list_sessions(self) -> dict[str, Any]:
         result = await self.call("session/list", {"limit": 200})
+        now = time.time()
+        after = stuck_after_seconds()
         owned = []
         for item in result.get("sessions", []):
-            if item["sessionId"] in self.sessions:
-                owned.append({**item, "alias": self.sessions[item["sessionId"]].get("alias")})
+            session_id = item["sessionId"]
+            if session_id not in self.sessions:
+                continue
+            state = self.sessions[session_id]
+            merged = {**item, "alias": state.get("alias")}
+            for key in ("tokenUsage", "contextUsage", "modelId", "budget", "lastActivity"):
+                merged.setdefault(key, state.get(key))
+            merged["overBudget"] = bool(state.get("overBudget"))
+            merged["needsOwnerAction"] = bool(state.get("needsOwnerAction"))
+            stuck = lane_stuck(state, now, after)
+            if stuck and stuck.get("reason") == "idle" and state.get("workspace"):
+                repo_ts = await asyncio.to_thread(repo_activity_ts, state.get("workspace"))
+                if repo_ts is not None:
+                    state["lastRepoActivity"] = repo_ts
+                    stuck = lane_stuck(state, now, after)
+            merged["stuck"] = stuck
+            if stuck and not state.get("stuckFlagged"):
+                state["stuckFlagged"] = True
+                self.record(
+                    {
+                        "kind": "lane.stuck",
+                        "sessionId": session_id,
+                        "reason": stuck.get("reason"),
+                        "detail": stuck,
+                        "summary": f"lane stuck ({stuck.get('reason')}): owner attention required",
+                    }
+                )
+            elif not stuck and state.get("stuckFlagged"):
+                state.pop("stuckFlagged", None)
+                self.record({"kind": "lane.recovered", "sessionId": session_id})
+            owned.append(merged)
         return {"sessions": owned}
+
+    async def set_budget(self, reference: str, spec: dict[str, Any]) -> dict[str, Any]:
+        session_id = self.resolve(reference)
+        budget = normalize_budget(spec)
+        state = self.sessions.setdefault(session_id, {"sessionId": session_id})
+        state["budget"] = budget
+        self.budgets[session_id] = budget
+        save_budgets(self.budgets)
+        self.refresh_budget_flag(state)
+        self.record({"kind": "budget.updated", "sessionId": session_id, "budget": budget})
+        return {"sessionId": session_id, "budget": budget}
+
+    async def get_budget(self, reference: str) -> dict[str, Any]:
+        session_id = self.resolve(reference)
+        state = self.sessions.get(session_id, {})
+        return {
+            "sessionId": session_id,
+            "budget": state.get("budget", self.budgets.get(session_id)),
+            "tokenUsage": state.get("tokenUsage"),
+            "contextUsage": state.get("contextUsage"),
+            "overBudget": bool(state.get("overBudget")),
+        }
+
+    async def clear_budget(self, reference: str) -> dict[str, Any]:
+        session_id = self.resolve(reference)
+        state = self.sessions.get(session_id)
+        if state is not None:
+            state.pop("budget", None)
+            self.refresh_budget_flag(state)
+        self.budgets.pop(session_id, None)
+        save_budgets(self.budgets)
+        self.record({"kind": "budget.removed", "sessionId": session_id})
+        return {"sessionId": session_id, "budget": None}
+
+    def enforce_model(self, session_id: str, params: dict[str, Any]) -> None:
+        state = self.sessions.get(session_id)
+        models = ((state or {}).get("budget") or {}).get("models")
+        if not models:
+            return
+        wanted = params.get("model", params.get("modelId"))
+        if wanted is not None and wanted not in models:
+            raise BudgetExceededError(
+                "modelNotAllowed",
+                f"model {wanted} is outside the lane budget {models}",
+            )
 
     async def supervised_call(
         self,
@@ -346,11 +793,26 @@ class MspHost:
         daemon's alias table via the `session` request field). A fresh
         commandId is minted for methods that require one, unless the caller
         passes an explicit id or "off".
+
+        Validates against the exported schema before hitting the wire
+        (unknown method / missing-but-required commandId raises
+        CallValidationError with no round-trip), and enforces lane budgets:
+        new turns on over-budget lanes and setModel outside the allowlist
+        raise BudgetExceededError.
         """
+        validate_call(method, params, command_id)
         merged = dict(params or {})
         if command_id != "off" and method in COMMAND_METHODS and "commandId" not in merged:
             merged["commandId"] = uuid7() if command_id in (None, "auto") else command_id
+        session_id = merged.get("sessionId")
+        if session_id:
+            if method == "turn/start":
+                self.enforce_budget(session_id)
+            elif method == "session/setModel":
+                self.enforce_model(session_id, merged)
         result = await self.call(method, merged)
+        if session_id:
+            self.owner_acted(session_id)
         self.record({"kind": "controller.call", "method": method, "sessionId": merged.get("sessionId")})
         return result
 
@@ -404,6 +866,17 @@ async def dispatch(host: MspHost, request: dict[str, Any]) -> Any:
         if request.get("session"):
             params["sessionId"] = host.resolve(request["session"])
         return await host.supervised_call(request["method"], params, request.get("commandId", "auto"))
+    if command == "budget":
+        if request.get("clear"):
+            return await host.clear_budget(request["session"])
+        spec = {
+            key: request[key]
+            for key in ("maxTokens", "maxContextTokens", "models")
+            if request.get(key) is not None
+        }
+        if spec:
+            return await host.set_budget(request["session"], spec)
+        return await host.get_budget(request["session"])
     if command == "stop":
         host.stopping.set()
         return {"stopping": True}
@@ -428,6 +901,9 @@ async def handle_client(host: MspHost, reader: asyncio.StreamReader, writer: asy
         response = {"ok": True, "result": result}
     except Exception as exc:  # Control boundary: errors are returned, not fatal.
         response = {"ok": False, "error": str(exc)}
+        kind = getattr(exc, "kind", None)
+        if kind:
+            response["errorKind"] = kind
     writer.write((json.dumps(response, separators=(",", ":")) + "\n").encode())
     await writer.drain()
     writer.close()
@@ -522,7 +998,7 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("serve", help=argparse.SUPPRESS)
     sub.add_parser("up", help="start the MSP controller daemon")
     sub.add_parser("down", help="stop the MSP controller daemon")
-    sub.add_parser("list", help="list sessions owned by this controller")
+    sub.add_parser("list", help="list owned sessions with budget, usage, and stuck flags")
     events = sub.add_parser("events", help="read summarized MSP events")
     events.add_argument("--after", type=float, default=0)
     events.add_argument("--limit", type=int, default=200)
@@ -534,6 +1010,9 @@ def parser() -> argparse.ArgumentParser:
     launch.add_argument("--workspace", required=True)
     launch.add_argument("--prompt", required=True)
     launch.add_argument("--model")
+    launch.add_argument("--max-tokens", type=int, help="per-lane cumulative token cap")
+    launch.add_argument("--max-context-tokens", type=int, help="per-lane context occupancy cap")
+    launch.add_argument("--models", help="comma-separated per-lane model allowlist")
     launch.add_argument("--reasoning-effort")
     launch.add_argument(
         "--approval-mode",
@@ -546,6 +1025,13 @@ def parser() -> argparse.ArgumentParser:
     send.add_argument("--reasoning-effort")
     pending = sub.add_parser("pending", help="list pending approvals and user input")
     pending.add_argument("session")
+
+    budget = sub.add_parser("budget", help="show or set a lane's token/context/model budget")
+    budget.add_argument("session")
+    budget.add_argument("--max-tokens", type=int, help="cumulative token cap")
+    budget.add_argument("--max-context-tokens", type=int, help="context occupancy cap")
+    budget.add_argument("--models", help="comma-separated model allowlist")
+    budget.add_argument("--clear", action="store_true", help="remove the lane budget")
 
     call = sub.add_parser(
         "call",
@@ -665,7 +1151,7 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
     if command == "events":
         return {"command": "events", "after": args.after, "limit": args.limit}
     if command == "launch":
-        return {
+        request = {
             "command": "launch",
             "name": args.name,
             "workspace": args.workspace,
@@ -674,6 +1160,19 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
             "reasoningEffort": args.reasoning_effort,
             "approvalMode": args.approval_mode,
         }
+        budget = {}
+        if args.max_tokens is not None:
+            budget["maxTokens"] = args.max_tokens
+        if args.max_context_tokens is not None:
+            budget["maxContextTokens"] = args.max_context_tokens
+        if args.models:
+            budget["models"] = args.models
+        if budget:
+            try:
+                request["budget"] = normalize_budget(budget)
+            except ValueError as exc:
+                raise SystemExit(f"invalid budget: {exc}")
+        return request
     if command == "send":
         return {
             "command": "send",
@@ -683,6 +1182,18 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
         }
     if command == "pending":
         return {"command": "pending", "session": args.session}
+    if command == "budget":
+        request = {"command": "budget", "session": args.session}
+        if args.clear:
+            request["clear"] = True
+            return request
+        if args.max_tokens is not None:
+            request["maxTokens"] = args.max_tokens
+        if args.max_context_tokens is not None:
+            request["maxContextTokens"] = args.max_context_tokens
+        if args.models:
+            request["models"] = args.models
+        return request
     if command == "call":
         try:
             params = json.loads(args.params)
@@ -690,6 +1201,10 @@ def build_request(args: argparse.Namespace) -> dict[str, Any]:
             raise SystemExit(f"invalid --params JSON: {exc}")
         if not isinstance(params, dict):
             raise SystemExit("--params must be a JSON object")
+        try:
+            validate_call(args.method, params, args.command_id)
+        except CallValidationError as exc:
+            raise SystemExit(f"{exc.kind}: {exc}")
         return call_request(args.method, args.session, params, args.command_id)
     if command == "read":
         return call_request("session/read", args.session)
