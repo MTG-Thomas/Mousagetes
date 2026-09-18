@@ -240,12 +240,19 @@ class WebRosterTest(unittest.TestCase):
                 {},
             ],
         )
-        self.assertEqual(roster, {"hosts": ["a", "b"], "lanes": ["lane-x", "lane-y"]})
+        self.assertEqual(
+            roster, {"hosts": ["a", "b"], "lanes": ["lane-x", "lane-y"], "tui": []}
+        )
 
     def test_empty_roster(self) -> None:
         self.assertEqual(
-            muse_msp.web_collect_roster([], [], []), {"hosts": [], "lanes": []}
+            muse_msp.web_collect_roster([], [], []),
+            {"hosts": [], "lanes": [], "tui": []},
         )
+
+    def test_collects_tui_names_sorted(self) -> None:
+        roster = muse_msp.web_collect_roster([], [], [], ["b-tui", "a-tui", "a-tui"])
+        self.assertEqual(roster["tui"], ["a-tui", "b-tui"])
 
     def test_expired_intents_excluded(self) -> None:
         import time
@@ -260,7 +267,22 @@ class WebRosterTest(unittest.TestCase):
                 {"message": {"lane": "no-ttl"}},
             ],
         )
-        self.assertEqual(roster, {"hosts": [], "lanes": ["live", "no-ttl"]})
+        self.assertEqual(
+            roster, {"hosts": [], "lanes": ["live", "no-ttl"], "tui": []}
+        )
+
+
+class WebLocalSessionsTest(unittest.TestCase):
+    def test_scan_never_raises_and_returns_list(self) -> None:
+        found = muse_msp.web_local_tui_sessions()
+        self.assertIsInstance(found, list)
+        for item in found:
+            for key in ("name", "sessionId", "workspace", "pid"):
+                self.assertIn(key, item)
+                self.assertTrue(item[key])
+
+    def test_unknown_session_has_no_name(self) -> None:
+        self.assertIsNone(muse_msp.web_session_name("00000000-0000-0000-0000-000000000000"))
 
 
 class WebAdviseTest(unittest.TestCase):
@@ -475,7 +497,9 @@ class WebPageTest(unittest.TestCase):
             "/api/coordinator",
             "/api/coordinators",
             "/api/advise",
-            "intent published",
+            "message coordinator",
+            "sendMessage",
+            "local sessions",
             "renderFleet",
             "budgetMeter",
             "laneGroup",
