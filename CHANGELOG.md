@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+- Web lane board no longer flags unloaded lanes as STUCK: a server-side
+  `notLoaded` status is a lifecycle state (merged/reaped), so `list` marks
+  the row `unloaded` with no stuck flag, and the board gets its own
+  `unloaded (n)` group with a `done` chip instead of crying wolf.
+- Shorten the SEND ADVICE coordinator-override placeholder so it stops
+  truncating.
+
 ## v0.5.0
 - `m8s reload` hot upgrade: the daemon finishes its response, shuts
   down cleanly, and execs the script file fresh, so edited code takes

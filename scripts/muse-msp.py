@@ -2743,25 +2743,37 @@ class MspHost:
                 merged.setdefault(key, state.get(key))
             merged["overBudget"] = bool(state.get("overBudget"))
             merged["needsOwnerAction"] = bool(state.get("needsOwnerAction"))
-            stuck = lane_stuck(state, now, after)
-            if stuck and stuck.get("reason") == "idle" and state.get("workspace"):
-                repo_ts = await asyncio.to_thread(repo_activity_ts, state.get("workspace"))
-                if repo_ts is not None:
-                    state["lastRepoActivity"] = repo_ts
-                    stuck = lane_stuck(state, now, after)
-            merged["stuck"] = stuck
-            if stuck and not state.get("stuckFlagged"):
+            # An unloaded lane has no live host process: the server reports
+            # `notLoaded` for it. That is a lifecycle state (idle/merged/
+            # reaped), not a stall — judging it by transcript idleness would
+            # flag every merged-and-reaped lane as stuck. Surface it as its
+            # own marker and keep the stuck accounting for loaded lanes.
+            unloaded = str(item.get("status") or "").lower() == "notloaded"
+            merged["unloaded"] = unloaded
+            if unloaded:
+                merged["stuck"] = None
+                if state.pop("stuckFlagged", None) is not None:
+                    self.record({"kind": "lane.recovered", "sessionId": session_id})
+            else:
+                stuck = lane_stuck(state, now, after)
+                if stuck and stuck.get("reason") == "idle" and state.get("workspace"):
+                    repo_ts = await asyncio.to_thread(repo_activity_ts, state.get("workspace"))
+                    if repo_ts is not None:
+                        state["lastRepoActivity"] = repo_ts
+                        stuck = lane_stuck(state, now, after)
+                merged["stuck"] = stuck
+            if merged["stuck"] and not state.get("stuckFlagged"):
                 state["stuckFlagged"] = True
                 self.record(
                     {
                         "kind": "lane.stuck",
                         "sessionId": session_id,
-                        "reason": stuck.get("reason"),
-                        "detail": stuck,
-                        "summary": f"lane stuck ({stuck.get('reason')}): owner attention required",
+                        "reason": merged["stuck"].get("reason"),
+                        "detail": merged["stuck"],
+                        "summary": f"lane stuck ({merged['stuck'].get('reason')}): owner attention required",
                     }
                 )
-            elif not stuck and state.get("stuckFlagged"):
+            elif not merged["stuck"] and state.get("stuckFlagged"):
                 state.pop("stuckFlagged", None)
                 self.record({"kind": "lane.recovered", "sessionId": session_id})
             owned.append(merged)
@@ -4226,7 +4238,7 @@ pre{background:#0b0e12;border:1px solid var(--line);border-radius:7px;padding:10
 <section id="send-panel"><h2>send advice</h2>
 <div class="rowline">
 <select id="coord-select" aria-label="coordinator lane"><option value="">coordinator: none</option></select>
-<input id="send-session" type="text" placeholder="other coordinator (default: selected)" aria-label="coordinator override">
+<input id="send-session" type="text" placeholder="other coordinator" aria-label="coordinator override">
 </div>
 <textarea id="send-prompt" placeholder="advice for the coordinator lane"></textarea>
 <div class="rowline" style="margin-top:10px;margin-bottom:0">
@@ -4289,6 +4301,7 @@ function laneChips(s) {
   const out = [];
   const st = (s.status || "").toLowerCase();
   out.push('<span class="chip ' + (st === "running" ? "run" : "idle") + '">' + esc(s.status || "?") + "</span>");
+  if (s.unloaded) out.push('<span class="chip">done</span>');
   if (s.stuck) out.push('<span class="chip stuck">stuck</span>');
   if (s.needsOwnerAction) out.push('<span class="chip blocked">blocked</span>');
   if (s.overBudget) out.push('<span class="chip budget">budget</span>');
@@ -4397,6 +4410,7 @@ function routeEvent(e) {
 }
 function laneGroup(s) {
   if (s.needsOwnerAction) return "blocked";
+  if (s.unloaded) return "unloaded";
   if (s.stuck) return "stuck";
   if ((s.status || "").toLowerCase() === "running") return "running";
   return "idle";
@@ -4416,9 +4430,9 @@ function laneRowHtml(s) {
     + esc(s.alias || s.name || s.sessionId || "?") + "</span>" + laneChips(s) + "</div>" + budgetMeter(s) + "</div>";
 }
 function renderFleet(sessions) {
-  const groups = {blocked: [], stuck: [], running: [], idle: []};
+  const groups = {blocked: [], stuck: [], running: [], idle: [], unloaded: []};
   sessions.forEach((s) => { groups[laneGroup(s)].push(s); });
-  return ["blocked", "stuck", "running", "idle"].map((g) => {
+  return ["blocked", "stuck", "running", "idle", "unloaded"].map((g) => {
     if (!groups[g].length) return "";
     return '<div class="grp"><h3>' + g + " (" + groups[g].length + ")</h3>"
       + groups[g].map(laneRowHtml).join("") + "</div>";
@@ -4427,9 +4441,9 @@ function renderFleet(sessions) {
 // Keyed lane patch: reuse rows whose HTML is unchanged (no flicker, no
 // scroll/focus loss), replace only changed rows, move rows across groups.
 function patchLanes(box, sessions) {
-  const groups = {blocked: [], stuck: [], running: [], idle: []};
+  const groups = {blocked: [], stuck: [], running: [], idle: [], unloaded: []};
   sessions.forEach((s) => { groups[laneGroup(s)].push(s); });
-  const order = ["blocked", "stuck", "running", "idle"];
+  const order = ["blocked", "stuck", "running", "idle", "unloaded"];
   if (!sessions.length) {
     box.innerHTML = '<span class="mut">no sessions</span>';
     return;

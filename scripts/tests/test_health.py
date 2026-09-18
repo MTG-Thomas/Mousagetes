@@ -406,6 +406,60 @@ class HealthDispatchTest(unittest.TestCase):
         )
 
 
+class UnloadedLaneTest(unittest.TestCase):
+    """A notLoaded (merged/reaped) lane is a lifecycle state, not a stall.
+
+    Regression for the web board flagging merged-and-reaped lanes as STUCK
+    because transcript idleness alone was judged.
+    """
+
+    def _run(self, status):
+        import asyncio
+
+        class FakeHost(muse_msp.MspHost):
+            def __init__(self) -> None:
+                self.records = []
+                self.sessions = {
+                    "lane-a": {
+                        "sessionId": "lane-a",
+                        "alias": "lane-a",
+                        "status": status,
+                        "lastActivity": NOW - 100_000,
+                    }
+                }
+                self.budgets = {}
+                self.watchers = set()
+
+            def record(self, record) -> None:
+                self.records.append(record)
+
+            async def call(self, method, params=None):
+                if method == "session/list":
+                    return {"sessions": [{"sessionId": "lane-a", "status": status}]}
+                raise AssertionError(f"unexpected call: {method}")
+
+        async def go():
+            host = FakeHost()
+            return host, await host.list_sessions()
+
+        return asyncio.run(go())
+
+    def test_not_loaded_lane_is_not_stuck(self) -> None:
+        host, result = self._run("notLoaded")
+        row = result["sessions"][0]
+        self.assertTrue(row["unloaded"])
+        self.assertIsNone(row["stuck"])
+        self.assertEqual([], [r for r in host.records if r["kind"] == "lane.stuck"])
+
+    def test_loaded_idle_lane_is_still_stuck(self) -> None:
+        host, result = self._run("idle")
+        row = result["sessions"][0]
+        self.assertFalse(row["unloaded"])
+        self.assertIsNotNone(row["stuck"])
+        self.assertEqual(row["stuck"]["reason"], "idle")
+        self.assertIn("lane.stuck", [r["kind"] for r in host.records])
+
+
 class PrChecksTest(unittest.TestCase):
     def test_maps_rollup_to_state(self) -> None:
         self.assertEqual(
