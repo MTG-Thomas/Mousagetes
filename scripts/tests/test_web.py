@@ -105,6 +105,93 @@ class WebSseTest(unittest.TestCase):
         self.assertTrue(raw.startswith(b"data: "))
         self.assertTrue(raw.endswith(b"\n\n"))
 
+    def test_record_at_numeric(self) -> None:
+        self.assertEqual(muse_msp.web_record_at({"at": 3.5}), 3.5)
+        self.assertEqual(muse_msp.web_record_at({}), 0.0)
+
+    def test_record_at_malformed(self) -> None:
+        self.assertEqual(muse_msp.web_record_at({"at": "nope"}), 0.0)
+        self.assertEqual(muse_msp.web_record_at({"at": None}), 0.0)
+        self.assertEqual(muse_msp.web_record_at(None), 0.0)
+
+    def test_framing_carries_resume_id(self) -> None:
+        raw = muse_msp.web_sse_format({"at": 12.5, "kind": "x"})
+        self.assertIn(b"\nid: 12.5\n\n", raw)
+
+    def test_stream_after_prefers_last_event_id(self) -> None:
+        query = {"after": ["3.0"]}
+        self.assertEqual(
+            muse_msp.web_stream_after({"Last-Event-ID": "9.25"}, query), 9.25
+        )
+        self.assertEqual(muse_msp.web_stream_after({}, query), 3.0)
+
+    def test_stream_after_invalid_falls_back(self) -> None:
+        self.assertEqual(
+            muse_msp.web_stream_after({"Last-Event-ID": "nope"}, {"after": ["bad"]}),
+            0.0,
+        )
+        self.assertEqual(muse_msp.web_stream_after(None, {}), 0.0)
+
+
+class WebEventBusTest(unittest.TestCase):
+    def test_tail_returns_newer_records(self) -> None:
+        bus = muse_msp.WebEventBus()
+        bus._publish({"at": 1.0, "kind": "a"})
+        bus._publish({"at": 2.0, "kind": "b"})
+        fresh, caught_up = bus.tail(1.5, 0.1)
+        self.assertTrue(caught_up)
+        self.assertEqual([r["kind"] for r in fresh], ["b"])
+
+    def test_tail_timeout_when_caught_up(self) -> None:
+        bus = muse_msp.WebEventBus()
+        bus._publish({"at": 1.0, "kind": "a"})
+        fresh, caught_up = bus.tail(1.0, 0.1)
+        self.assertTrue(caught_up)
+        self.assertEqual(fresh, [])
+
+    def test_tail_wakes_on_publish(self) -> None:
+        import threading
+
+        bus = muse_msp.WebEventBus()
+        seen: list = []
+        worker = threading.Thread(
+            target=lambda: seen.append(bus.tail(0.0, 5.0)), daemon=True
+        )
+        worker.start()
+        bus._publish({"at": 7.0, "kind": "live"})
+        worker.join(5.0)
+        self.assertFalse(worker.is_alive())
+        fresh, caught_up = seen[0]
+        self.assertTrue(caught_up)
+        self.assertEqual([r["kind"] for r in fresh], ["live"])
+
+    def test_tail_flags_evicted_history(self) -> None:
+        bus = muse_msp.WebEventBus(maxlen=2)
+        bus._publish({"at": 1.0, "kind": "a"})
+        bus._publish({"at": 2.0, "kind": "b"})
+        bus._publish({"at": 3.0, "kind": "c"})
+        fresh, caught_up = bus.tail(0.5, 0.1)
+        self.assertFalse(caught_up)
+
+    def test_start_is_idempotent(self) -> None:
+        import threading
+
+        bus = muse_msp.WebEventBus()
+        calls: list = []
+        bus._pump = lambda: calls.append(1)  # type: ignore[method-assign]
+        before = threading.active_count()
+        bus.start()
+        bus.start()
+        for _ in range(100):
+            if len(calls) >= 1:
+                break
+            import time
+
+            time.sleep(0.01)
+        self.assertTrue(bus._started)
+        self.assertEqual(len(calls), 1)
+        self.assertLessEqual(threading.active_count(), before + 1)
+
 
 class WebPublicPathsTest(unittest.TestCase):
     def test_index_is_public(self) -> None:
@@ -392,6 +479,15 @@ class WebPageTest(unittest.TestCase):
             "renderFleet",
             "budgetMeter",
             "laneGroup",
+            "patchLanes",
+            "patchKeyed",
+            "laneRowHtml",
+            "data-lane",
+            "data-k",
+            "tailTranscript",
+            "appendTxEvents",
+            "txKey",
+            "data-tx",
             'class="meter"',
             "txRow",
             "toggleDiff",

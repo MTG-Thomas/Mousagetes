@@ -11,13 +11,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import http.server
 import json
 import os
 import secrets
 import signal
+import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 from pathlib import Path
@@ -3974,7 +3977,128 @@ def web_write_coordinator(session: str | None, path: Path = WEB_COORD_FILE) -> s
 
 
 def web_sse_format(record: dict[str, Any]) -> bytes:
-    return ("data: " + json.dumps(record, separators=(",", ":")) + "\n\n").encode()
+    # The id line lets EventSource resume with Last-Event-ID after a drop;
+    # it trails the data line so existing data-first framing is unchanged.
+    body = json.dumps(record, separators=(",", ":"))
+    return (f"data: {body}\nid: {web_record_at(record)}\n\n").encode()
+
+
+def web_stream_after(headers: Any, query: dict[str, list[str]]) -> float:
+    """Resume cursor: Last-Event-ID header wins, ?after= is the fallback."""
+    last_id = ""
+    try:
+        last_id = (headers.get("Last-Event-ID") or "").strip()
+    except AttributeError:
+        last_id = ""
+    if last_id:
+        try:
+            return float(last_id)
+        except ValueError:
+            pass
+    try:
+        return float(query.get("after", ["0"])[0])
+    except (ValueError, IndexError):
+        return 0.0
+
+
+def web_record_at(record: Any) -> float:
+    """Numeric event cursor with a safe default for malformed records."""
+    try:
+        return float(record.get("at", 0) or 0)
+    except (TypeError, ValueError, AttributeError):
+        return 0.0
+
+
+class WebEventBus:
+    """One upstream daemon watch fanned out to every SSE client.
+
+    A single background thread holds a ``watch`` connection on the
+    controller socket and appends each record to a bounded buffer; SSE
+    handler threads wait on the condition instead of polling the events
+    file. When the daemon is unreachable (bounce/reload) the pump falls
+    back to polling read_events so live streams survive the gap, then
+    resumes the push stream with exponential backoff.
+    """
+
+    def __init__(self, maxlen: int = 2000) -> None:
+        self._cond = threading.Condition()
+        self._buffer: collections.deque[dict[str, Any]] = collections.deque(maxlen=maxlen)
+        self._maxlen = maxlen
+        self._last_at = 0.0
+        self._started = False
+
+    def start(self) -> None:
+        with self._cond:
+            if self._started:
+                return
+            self._started = True
+        thread = threading.Thread(target=self._pump, name="m8s-web-bus", daemon=True)
+        thread.start()
+
+    def _publish(self, record: dict[str, Any]) -> None:
+        with self._cond:
+            self._buffer.append(record)
+            self._last_at = max(self._last_at, web_record_at(record))
+            self._cond.notify_all()
+
+    def _pump(self) -> None:
+        backoff = 1.0
+        while True:
+            try:
+                self._stream_watch()
+                backoff = 1.0
+            except (OSError, ValueError):
+                pass
+            deadline = time.monotonic() + backoff
+            while time.monotonic() < deadline:
+                try:
+                    for record in read_events(self._last_at, 200):
+                        self._publish(record)
+                except OSError:
+                    pass
+                time.sleep(1)
+            backoff = min(backoff * 2, 15.0)
+
+    def _stream_watch(self) -> None:
+        request = {"command": "watch", "after": self._last_at, "limit": 200}
+        payload = (json.dumps(request, separators=(",", ":")) + "\n").encode()
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            # Quiet daemons send nothing; the timeout only bounds a
+            # half-dead connection, and reconnect replays from last_at.
+            sock.settimeout(120)
+            sock.connect(str(SOCKET))
+            sock.sendall(payload)
+            with sock.makefile("r", encoding="utf-8") as stream:
+                while True:
+                    line = stream.readline()
+                    if not line:
+                        raise OSError("daemon closed watch connection")
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(record, dict):
+                        self._publish(record)
+        finally:
+            sock.close()
+
+    def tail(self, after: float, timeout: float) -> tuple[list[dict[str, Any]], bool]:
+        """Records newer than ``after``; False when the buffer has evicted
+        history the caller has not seen (caller must re-read the file)."""
+        with self._cond:
+            if not self._cond.wait_for(
+                lambda: any(web_record_at(r) > after for r in self._buffer),
+                timeout=timeout,
+            ):
+                return [], True
+            oldest = web_record_at(self._buffer[0]) if self._buffer else after
+            fresh = [r for r in self._buffer if web_record_at(r) > after]
+            evicted = len(self._buffer) >= self._maxlen and after < oldest
+            return fresh, not evicted
+
+
+WEB_EVENT_BUS = WebEventBus()
 
 
 def web_validate_send_payload(obj: Any) -> tuple[str, str]:
@@ -4255,7 +4379,7 @@ function routeEvent(e) {
   if (/turn/i.test(kind)) {
     later("lanes", refreshLanes, 2000);
     later("health", refreshHealth, 8000);
-    if (mine) later("transcript", readTranscript, 800);
+    if (mine) later("transcript", tailTranscript, 800);
   }
   if (/approval|userInput|blocker/i.test(kind)) {
     later("lanes", refreshLanes, 500);
@@ -4268,7 +4392,7 @@ function routeEvent(e) {
     later("health", refreshHealth, 1000);
   }
   if (/HealthChanged|\bgap\b/.test(kind)) {
-    if (mine) later("transcript", readTranscript, 800);
+    if (mine) later("transcript", tailTranscript, 800);
   }
 }
 function laneGroup(s) {
@@ -4286,16 +4410,86 @@ function budgetMeter(s) {
   return '<div class="meter" title="' + used + " / " + max + ' tokens"><i class="' + cls + '" style="width:' + pct + '%"></i></div>'
     + '<div class="meter-lab">' + used + " / " + max + " tokens</div>";
 }
+function laneKey(s) { return String(s.sessionId || s.alias || s.name || "?"); }
+function laneRowHtml(s) {
+  return '<div class="lane" data-lane="' + esc(laneKey(s)) + '"><div class="top"><span class="nm">'
+    + esc(s.alias || s.name || s.sessionId || "?") + "</span>" + laneChips(s) + "</div>" + budgetMeter(s) + "</div>";
+}
 function renderFleet(sessions) {
   const groups = {blocked: [], stuck: [], running: [], idle: []};
   sessions.forEach((s) => { groups[laneGroup(s)].push(s); });
   return ["blocked", "stuck", "running", "idle"].map((g) => {
     if (!groups[g].length) return "";
-    return '<div class="grp"><h3>' + g + " (" + groups[g].length + ")</h3>" + groups[g].map((s) =>
-      '<div class="lane"><div class="top"><span class="nm">' + esc(s.alias || s.name || s.sessionId || "?")
-      + "</span>" + laneChips(s) + "</div>" + budgetMeter(s) + "</div>"
-    ).join("") + "</div>";
+    return '<div class="grp"><h3>' + g + " (" + groups[g].length + ")</h3>"
+      + groups[g].map(laneRowHtml).join("") + "</div>";
   }).join("");
+}
+// Keyed lane patch: reuse rows whose HTML is unchanged (no flicker, no
+// scroll/focus loss), replace only changed rows, move rows across groups.
+function patchLanes(box, sessions) {
+  const groups = {blocked: [], stuck: [], running: [], idle: []};
+  sessions.forEach((s) => { groups[laneGroup(s)].push(s); });
+  const order = ["blocked", "stuck", "running", "idle"];
+  if (!sessions.length) {
+    box.innerHTML = '<span class="mut">no sessions</span>';
+    return;
+  }
+  [...box.children].forEach((n) => {
+    if (n.nodeType === 1 && !n.hasAttribute("data-grp")) n.remove();
+  });
+  order.forEach((g) => {
+    const list = groups[g];
+    let grp = box.querySelector('[data-grp="' + g + '"]');
+    if (!list.length) { if (grp) grp.remove(); return; }
+    if (!grp) {
+      grp = document.createElement("div");
+      grp.className = "grp";
+      grp.setAttribute("data-grp", g);
+      box.appendChild(grp);
+    }
+    let h = grp.querySelector("h3");
+    if (!h) { h = document.createElement("h3"); grp.prepend(h); }
+    h.textContent = g + " (" + list.length + ")";
+    const live = new Map();
+    grp.querySelectorAll("[data-lane]").forEach((n) => live.set(n.getAttribute("data-lane"), n));
+    list.forEach((s) => {
+      const cur = live.get(laneKey(s));
+      const html = laneRowHtml(s);
+      if (cur) {
+        live.delete(laneKey(s));
+        if (cur.outerHTML === html) { grp.appendChild(cur); return; }
+        cur.remove();
+      }
+      grp.insertAdjacentHTML("beforeend", html);
+    });
+    live.forEach((n) => n.remove());
+  });
+  order.forEach((g) => {
+    const grp = box.querySelector('[data-grp="' + g + '"]');
+    if (grp) box.appendChild(grp);
+  });
+}
+// Shallow keyed patch for flat lists (inbox): identical nodes are reused
+// in place, so typed feedback and focus survive refreshes.
+function patchKeyed(box, html) {
+  const tmp = document.createElement("div");
+  tmp.innerHTML = html;
+  const live = new Map();
+  [...box.children].forEach((n) => {
+    if (n.nodeType === 1 && n.hasAttribute("data-k")) live.set(n.getAttribute("data-k"), n);
+  });
+  const frag = document.createDocumentFragment();
+  [...tmp.children].forEach((n) => {
+    if (n.nodeType !== 1 || !n.hasAttribute("data-k")) { frag.appendChild(n); return; }
+    const k = n.getAttribute("data-k");
+    const cur = live.get(k);
+    live.delete(k);
+    if (cur && cur.outerHTML === n.outerHTML) { frag.appendChild(cur); return; }
+    if (cur) cur.remove();
+    frag.appendChild(n);
+  });
+  live.forEach((n) => n.remove());
+  box.replaceChildren(frag);
 }
 async function refreshLanes() {
   const box = $("lanes");
@@ -4312,7 +4506,7 @@ async function refreshLanes() {
       }
     });
     $("lanes-count").textContent = sessions.length + " session" + (sessions.length === 1 ? "" : "s");
-    box.innerHTML = renderFleet(sessions) || '<span class="mut">no sessions</span>';
+    patchLanes(box, sessions);
     ages.lanes = Date.now() / 1000; paintAges();
   } catch (e) {
     box.innerHTML = '<pre>lanes failed: ' + esc(e.message) + "</pre>";
@@ -4359,7 +4553,43 @@ async function refreshEvents() {
     $("events").innerHTML = '<span class="mut">events failed: ' + esc(e.message) + "</span>";
   }
 }
-let txSession = "", txCursor = null, activeTurn = null;
+let txSession = "", txCursor = null, txTailCursor = "", txSeen = new Set(), activeTurn = null;
+function txReset(s) {
+  txSession = s; txCursor = null; txTailCursor = ""; txSeen = new Set(); activeTurn = null;
+  $("transcript").innerHTML = "";
+}
+// Stable row identity: the view's item id, else its per-event cursor,
+// else the page tag plus position (deterministic per page for dedupe).
+function txKey(e, i, pageTag) {
+  const p = (e && e.params) || {};
+  const last = (p.sourceRange && p.sourceRange.last) || {};
+  if (last.id) return "id:" + last.id;
+  if (typeof p.viewCursor === "string" && p.viewCursor) return "vc:" + p.viewCursor;
+  return "p:" + pageTag + ":" + (e.method || "?") + ":" + i;
+}
+function txRowKeyed(e, key) {
+  return txRow(e).replace(/^<div/, '<div data-tx="' + esc(key) + '"');
+}
+// Append only rows not already shown; tracks the newest shown cursor so
+// live tails can fetch strictly newer events. Returns rows appended.
+function appendTxEvents(box, events, pageTag) {
+  let added = 0;
+  (events || []).forEach((e, i) => {
+    const k = txKey(e, i, pageTag);
+    if (txSeen.has(k)) return;
+    txSeen.add(k);
+    const t = document.createElement("div");
+    t.innerHTML = txRowKeyed(e, k);
+    while (t.firstChild) box.appendChild(t.firstChild);
+    added++;
+    const vc = e && e.params && e.params.viewCursor;
+    if (typeof vc === "string" && vc) txTailCursor = vc;
+  });
+  return added;
+}
+function txPinned(box) {
+  return box.scrollHeight - box.scrollTop - (box.clientHeight || 0) < 40;
+}
 function txText(s, max) {
   const t = String(s === undefined || s === null ? "" : s);
   return esc(t.length > max ? t.slice(0, max) + "…" : t);
@@ -4396,10 +4626,7 @@ function txRow(e) {
 async function readTranscript(more) {
   const s = $("view-session").value.trim();
   if (!s) return;
-  if (!more || s !== txSession) {
-    txSession = s; txCursor = null; activeTurn = null;
-    $("transcript").innerHTML = "";
-  }
+  if (!more || s !== txSession) txReset(s);
   try {
     const hdr = await get("/api/read?session=" + encodeURIComponent(s));
     const sess = hdr && hdr.result && hdr.result.session;
@@ -4413,14 +4640,31 @@ async function readTranscript(more) {
     const data = await get(url);
     const res = (data && data.result) || {};
     const box = $("transcript");
-    const wrap = document.createElement("div");
-    wrap.innerHTML = (res.events || []).map(txRow).join("");
-    while (wrap.firstChild) box.appendChild(wrap.firstChild);
+    const pinned = txPinned(box);
+    appendTxEvents(box, res.events || [], txCursor || "head");
     txCursor = res.nextCursor || null;
     $("tx-more").hidden = !txCursor;
-    if (!more) box.scrollTop = box.scrollHeight;
+    if (!more || pinned) box.scrollTop = box.scrollHeight;
   } catch (e) {
     $("transcript").innerHTML = '<span class="mut">read failed: ' + esc(e.message) + "</span>";
+  }
+}
+// Live tail: fetch strictly newer events for the open session and append
+// only unseen rows. Falls back to a full read when nothing is open yet.
+async function tailTranscript() {
+  const s = $("view-session").value.trim();
+  if (!s || s !== txSession || !txTailCursor) { readTranscript(); return; }
+  try {
+    const data = await get("/api/view?session=" + encodeURIComponent(s) + "&limit=50"
+      + "&cursor=" + encodeURIComponent(txTailCursor));
+    const res = (data && data.result) || {};
+    const box = $("transcript");
+    const pinned = txPinned(box);
+    const added = appendTxEvents(box, res.events || [], txTailCursor);
+    if (added && pinned) box.scrollTop = box.scrollHeight;
+    if (res.nextCursor) { txCursor = res.nextCursor; $("tx-more").hidden = false; }
+  } catch (e) {
+    // Transient: the next explicit read or tail recovers; never clobber.
   }
 }
 async function toggleDiff(btn) {
@@ -4456,7 +4700,7 @@ async function turnOp(action, extra) {
     const data = await r.json();
     if (!data.ok) throw new Error((data.error || "daemon refused").slice(0, 120));
     $("turn-state").textContent = action + " ok";
-    refreshLanes(); readTranscript();
+    refreshLanes(); tailTranscript();
   } catch (e) {
     $("turn-state").textContent = action + " failed: " + String(e.message).slice(0, 120);
   }
@@ -4478,24 +4722,26 @@ async function refreshInbox() {
     const items = (data && data.result && data.result.inbox) || null;
     if (!Array.isArray(items)) throw new Error("unexpected shape");
     let n = 0;
-    box.innerHTML = items.map((entry) => {
+    const html = items.map((entry, ei) => {
       const who = esc(entry.alias || entry.sessionId || "?");
       const sid = entry.sessionId || "";
-      let html = "";
+      let out = "";
       if (entry.error)
-        html += '<div class="appr"><span class="who">' + who + '</span> <span class="err">' + esc(entry.error) + "</span></div>";
-      (entry.approvals || []).forEach((a) => { n++; html += approvalRow(who, sid, a); });
-      (entry.userInputs || []).forEach((u) => { n++; html += inputRow(who, sid, u); });
-      return html;
+        out += '<div class="appr" data-k="err:' + ei + ':' + esc(sid) + '"><span class="who">' + who + '</span> <span class="err">' + esc(entry.error) + "</span></div>";
+      (entry.approvals || []).forEach((a, ai) => { n++; out += approvalRow(who, sid, a, ei + ":" + ai); });
+      (entry.userInputs || []).forEach((u, ui) => { n++; out += inputRow(who, sid, u, ei + ":" + ui); });
+      return out;
     }).join("") || '<span class="mut">nothing pending</span>';
+    patchKeyed(box, html);
     $("inbox-count").textContent = n ? n + " waiting" : "";
     ages.inbox = Date.now() / 1000; paintAges();
   } catch (e) {
     box.innerHTML = '<span class="mut">inbox failed: ' + esc(e.message) + "</span>";
   }
 }
-function approvalRow(who, sid, a) {
+function approvalRow(who, sid, a, key) {
   const subj = a.subject || a.toolName || "approval";
+  const keyAttr = ' data-k="appr:' + esc(a.approvalId || key || "?") + '"';
   const args = (a.rawArgs || "").slice(0, 300);
   const req = reqStr(a.currentRequirementId);
   const choices = (a.availableChoices || []).map((c) =>
@@ -4506,14 +4752,15 @@ function approvalRow(who, sid, a) {
     ? '<input class="fb" type="text" placeholder="feedback for the model (optional, sent with denial)" aria-label="denial feedback">'
     : "";
   const prot = a.protectedWrite ? ' <span class="chip blocked">protected write</span>' : "";
-  return '<div class="appr"><span class="who">' + who + "</span> needs a decision" + prot
+  return '<div class="appr"' + keyAttr + '><span class="who">' + who + "</span> needs a decision" + prot
     + '<div class="tools">' + esc(subj) + (args ? " " + esc(args) : "") + "</div>" + fb
     + '<div class="choices">' + (choices || '<span class="mut">no choices offered</span>') + "</div></div>";
 }
-function inputRow(who, sid, u) {
+function inputRow(who, sid, u, key) {
   const qs = (u.questions || []).map((q) =>
     '<div class="q">' + esc(q.question || q.prompt || JSON.stringify(q)).slice(0, 300) + "</div>").join("");
-  return '<div class="appr input"><span class="who">' + who + "</span> asks"
+  const keyAttr = ' data-k="inp:' + esc(u.userInputId || key || "?") + '"';
+  return '<div class="appr input"' + keyAttr + '><span class="who">' + who + "</span> asks"
     + '<div class="tools">' + esc(u.toolName || "input") + "</div>" + qs
     + '<textarea class="ct" placeholder="clarification for the model (max 500 chars)"></textarea>'
     + '<div class="choices"><button class="ghost" data-clarify="1" data-sid="' + esc(sid)
@@ -4731,10 +4978,7 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
             if not self._authorized(query):
                 self._json(401, {"ok": False, "error": "unauthorized"})
                 return
-            try:
-                after = float(query.get("after", ["0"])[0])
-            except ValueError:
-                after = 0.0
+            after = web_stream_after(self.headers, query)
             kinds = web_parse_kinds(query)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -4745,18 +4989,30 @@ class WebHandler(http.server.BaseHTTPRequestHandler):
                 for record in read_events(after, 200):
                     if not web_event_allowed(record, kinds):
                         continue
-                    after = max(after, float(record.get("at", after)))
+                    after = max(after, web_record_at(record))
                     self.wfile.write(web_sse_format(record))
                 self.wfile.flush()
-                # Poll the shared events file; the web process is separate
-                # from the daemon so it cannot join host.watchers directly.
-                for _ in range(60):
-                    time.sleep(1)
-                    fresh = [r for r in read_events(after, 200) if web_event_allowed(r, kinds)]
+                # Live tail: one shared upstream daemon watch fanned out
+                # per client; the bus falls back to the events file while
+                # the daemon is unreachable. Keepalive comments hold idle
+                # connections open through proxies.
+                while True:
+                    fresh, caught_up = WEB_EVENT_BUS.tail(after, 25.0)
+                    if not caught_up:
+                        fresh = [
+                            r
+                            for r in read_events(after, 200)
+                            if web_event_allowed(r, kinds)
+                        ]
                     for record in fresh:
-                        after = max(after, float(record.get("at", after)))
+                        if not web_event_allowed(record, kinds):
+                            continue
+                        after = max(after, web_record_at(record))
                         self.wfile.write(web_sse_format(record))
                     if fresh:
+                        self.wfile.flush()
+                    else:
+                        self.wfile.write(b": keepalive\n\n")
                         self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
@@ -4995,6 +5251,7 @@ def run_web(bind: str, port: int, allow_remote: bool = False) -> int:
     web_check_bind(bind, allow_remote)
     token = web_ensure_token()
     WebHandler.expected_token = token
+    WEB_EVENT_BUS.start()
     server = http.server.ThreadingHTTPServer((bind, port), WebHandler)
     print(f"m8s web v1 on http://{bind}:{port}/ (token saved to {WEB_TOKEN_FILE})")
     print("pass it as X-m8s-token header or ?token= for the event stream")
