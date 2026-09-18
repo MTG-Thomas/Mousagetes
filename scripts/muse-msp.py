@@ -18,6 +18,7 @@ import os
 import secrets
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -3844,10 +3845,91 @@ def web_read_coordinator(path: Path = WEB_COORD_FILE) -> str | None:
     return value or None
 
 
+def muse_data_dir() -> Path:
+    base = os.environ.get("XDG_DATA_HOME")
+    return Path(base) / "muse" if base else Path.home() / ".local" / "share" / "muse"
+
+
+def web_session_name(session_id: str) -> str | None:
+    """Canonical TUI name for a session id, via the read-only name registry."""
+    db = muse_data_dir() / "session-name-authority" / "session-names.db"
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+    except (sqlite3.Error, OSError):
+        return None
+    try:
+        row = con.execute(
+            "SELECT normalized_name FROM session_name_claims "
+            "WHERE session_id = ? AND kind = 'canonical' LIMIT 1",
+            (session_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    return str(row[0]) if row and row[0] else None
+
+
+def web_local_tui_sessions() -> list[dict[str, str]]:
+    """Interactive Muse TUI sessions on this host.
+
+    Read-only /proc scan (Linux): a live `muse` process holding a session
+    log fd is a TUI; `serve` hosts are excluded. Name, workspace, and pid
+    are identity metadata only — no transcript content is read. Never
+    raises: discovery must not break the roster.
+    """
+    procs = Path("/proc")
+    store = muse_data_dir() / "sessions"
+    if not procs.is_dir():
+        return []
+    try:
+        pids = [entry for entry in procs.iterdir() if entry.name.isdigit()]
+    except OSError:
+        return []
+    found: dict[str, dict[str, str]] = {}
+    for pid_dir in pids:
+        try:
+            argv = (pid_dir / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        exe = os.path.basename(argv[0].decode("utf-8", "ignore")) if argv and argv[0] else ""
+        if exe != "muse" and "muse-bin" not in exe:
+            continue
+        if any("serve" in part.decode("utf-8", "ignore") for part in argv[1:]):
+            continue
+        try:
+            targets = [os.readlink(str(item)) for item in (pid_dir / "fd").iterdir()]
+        except OSError:
+            continue
+        session_id: str | None = None
+        for target in targets:
+            try:
+                parts = Path(target).relative_to(store).parts
+            except ValueError:
+                continue
+            if len(parts) >= 4:
+                session_id = parts[3]
+                break
+        if not session_id or session_id in found:
+            continue
+        try:
+            workspace = os.readlink(str(pid_dir / "cwd"))
+        except OSError:
+            workspace = ""
+        found[session_id] = {
+            "name": web_session_name(session_id) or session_id[:8],
+            "sessionId": session_id,
+            "workspace": workspace,
+            "pid": pid_dir.name,
+        }
+    return sorted(found.values(), key=lambda item: item["name"])
+
+
 def web_collect_roster(
     host_names: list[str],
     claims: list[dict[str, Any]],
     intents: list[dict[str, Any]],
+    tui: list[str] | tuple[str, ...] = (),
 ) -> dict[str, list[str]]:
     """Coordinator roster from off-serve sources. Pure: no I/O."""
     lanes: set[str] = set()
@@ -3868,12 +3950,17 @@ def web_collect_roster(
         lane = message.get("lane")
         if isinstance(lane, str) and lane:
             lanes.add(lane)
-    return {"hosts": sorted(set(host_names)), "lanes": sorted(lanes)}
+    return {
+        "hosts": sorted(set(host_names)),
+        "lanes": sorted(lanes),
+        "tui": sorted(set(tui)),
+    }
 
 
 def web_coordinator_roster() -> dict[str, list[str]]:
-    """Roster of coordinator identities outside `muse serve`: enrolled hosts
-    plus lanes seen on the claim/intent bus. File-backed, needs no daemon."""
+    """Roster of coordinator identities outside `muse serve`: enrolled hosts,
+    lanes seen on the claim/intent bus, and live TUI sessions on this host
+    (typically where the coordinator runs). File-backed, needs no daemon."""
     try:
         hosts = load_hosts()
     except (OSError, ValueError):
@@ -3886,7 +3973,11 @@ def web_coordinator_roster() -> dict[str, list[str]]:
         intents = read_bus("m8s.intent", limit=200)
     except (OSError, ValueError):
         intents = []
-    return web_collect_roster(list(hosts), claims, intents)
+    try:
+        tui = [item["name"] for item in web_local_tui_sessions()]
+    except Exception:
+        tui = []
+    return web_collect_roster(list(hosts), claims, intents, tui)
 
 
 def web_validate_approve_payload(obj: Any) -> dict[str, Any]:
@@ -4223,12 +4314,12 @@ pre{background:#0b0e12;border:1px solid var(--line);border-radius:7px;padding:10
 </section>
 </header>
 <main>
-<section id="send-panel"><h2>send advice</h2>
+<section id="send-panel"><h2>message coordinator</h2>
 <div class="rowline">
-<select id="coord-select" aria-label="coordinator lane"><option value="">coordinator: none</option></select>
+<select id="coord-select" aria-label="coordinator"><option value="">coordinator: none</option></select>
 <input id="send-session" type="text" placeholder="other coordinator (default: selected)" aria-label="coordinator override">
 </div>
-<textarea id="send-prompt" placeholder="advice for the coordinator lane"></textarea>
+<textarea id="send-prompt" placeholder="message for the coordinator"></textarea>
 <div class="rowline" style="margin-top:10px;margin-bottom:0">
 <button id="send-btn">send</button>
 <span id="send-state"></span>
@@ -4320,11 +4411,12 @@ async function setCoordinator(value) {
   syncCoordSelect();
 }
 async function loadCoordOptions() {
-  // Coordinators live outside `muse serve`: roster = enrolled hosts plus
-  // lanes seen on the claim/intent bus — never the served session list.
+  // Coordinators live outside `muse serve`: roster = enrolled hosts, lanes
+  // seen on the claim/intent bus, and live TUI sessions on this host —
+  // never the served session list.
   try {
     const data = await get("/api/coordinators");
-    const roster = (data && data.result) || {hosts: [], lanes: []};
+    const roster = (data && data.result) || {hosts: [], lanes: [], tui: []};
     const sel = $("coord-select");
     if (!sel) return;
     const cur = sel.value || coordinator || "";
@@ -4332,6 +4424,7 @@ async function loadCoordOptions() {
       items.length ? '<optgroup label="' + label + '">' + items.map((v) =>
         '<option value="' + esc(v) + '">' + esc(v) + "</option>").join("") + "</optgroup>" : "";
     sel.innerHTML = '<option value="">coordinator: none</option>'
+      + group("local sessions", roster.tui || [])
       + group("hosts", roster.hosts || []) + group("bus lanes", roster.lanes || []);
     sel.value = cur;
     syncCoordSelect();
@@ -4839,26 +4932,26 @@ async function refreshBoard() {
     $("board").innerHTML = '<span class="mut">board failed: ' + esc(e.message) + "</span>";
   }
 }
-async function sendAdvice() {
-  // Coordinators are outside `muse serve`: advice travels as an intent-bus
-  // message (verb "advise"), never a turn submit. The override box takes
-  // another coordinator identity, not a served session.
+async function sendMessage() {
+  // Coordinators live outside `muse serve`: the message travels as an
+  // intent-bus entry (verb "advise"), never a turn submit. The override
+  // box takes another coordinator identity, not a served session.
   const target = $("send-session").value.trim() || coordinator || "";
   const advice = $("send-prompt").value;
   const btn = $("send-btn");
   if (!target) {
-    $("send-state").textContent = "pick a coordinator above or type one";
+    $("send-state").textContent = "select a coordinator or enter one";
     return;
   }
   if (!advice.trim()) {
-    $("send-state").textContent = "write the advice first";
+    $("send-state").textContent = "write the message first";
     return;
   }
   btn.disabled = true;
-  $("send-state").textContent = "publishing intent...";
+  $("send-state").textContent = "sending…";
   try {
     const r = await fetch("/api/advise", {method: "POST", headers: headers(), body: JSON.stringify({coordinator: target, advice})});
-    $("send-state").textContent = r.ok ? "intent published" : ("failed: " + await r.text());
+    $("send-state").textContent = r.ok ? "sent" : ("failed: " + await r.text());
     if (r.ok) $("send-prompt").value = "";
   } catch (e) {
     $("send-state").textContent = "failed: " + e.message;
@@ -4906,7 +4999,7 @@ $("turn-steer").onclick = () => {
   turnOp("steer", {turnId: activeTurn, input: text});
   $("steer-input").value = "";
 };
-$("send-btn").onclick = sendAdvice;
+$("send-btn").onclick = sendMessage;
 $("inbox").addEventListener("click", (ev) => {
   const t = ev.target.closest("[data-approve],[data-clarify]");
   if (!t || t.disabled) return;
@@ -4917,7 +5010,7 @@ $("coord-select").onchange = async () => {
     await setCoordinator($("coord-select").value);
     $("send-state").textContent = "";
   } catch (e) {
-    $("send-state").textContent = "coordinator failed: " + e.message;
+    $("send-state").textContent = "coordinator update failed: " + e.message;
   }
 };
 $("save-token").onclick = () => {
