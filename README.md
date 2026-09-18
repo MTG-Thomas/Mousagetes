@@ -41,7 +41,33 @@ without the daemon.
 python3 -m unittest discover -s scripts/tests
 ```
 
-Stdlib only — no dependencies.
+## MSP wire types
+
+Method, notification, and error tables come from Meta's generated
+`muse-code-msp` package (zero runtime dependencies), not from
+hand-maintained lists in `scripts/muse-msp.py`. At daemon start the
+controller exports the installed `muse` binary's schema bundles
+(`muse schema generate-json-schema`, stable plus `--experimental`) and
+compares each fingerprint against the bundle constants and records any
+drift as a `schema.drift` event: a mismatch is a warning, never an
+error (sdk-cookbook `fingerprint-mismatch` posture — additive-optional
+evolution means an older bundle keeps working against a newer host).
+Only an export that cannot run at all stops startup (`schemaDrift`).
+
+`muse-code-msp` is not on PyPI, so `pyproject.toml` pins it to an SDK
+mirror commit (`git+https://github.com/meta-models/muse-code-sdk@<sha>`
+with `#subdirectory=python/clients/msp-py`). Install it before running
+the controller or the tests:
+
+```bash
+pip install .
+```
+
+Update procedure: pick a newer mirror commit whose
+`python/clients/msp-py` rendering covers the installed `muse` binary
+(`muse --version` vs the bundle's `REQUIRED_HOST_VERSION`), re-pin the
+`dependencies` URL, run the suite plus `ruff`, and confirm `up` records
+no `schema.drift`. Never hand-edit the generated files.
 
 ## License
 

@@ -10,6 +10,13 @@ readme = "README.md"
 license = { text = "AGPL-3.0-or-later" }
 requires-python = ">=3.10"
 authors = [{ name = "MTG-Thomas" }]
+# Generated MSP wire types (zero-dep). Pinned to an SDK mirror commit
+# because muse-code-msp is not published on PyPI; see README
+# "MSP wire types" for the update procedure. Never hand-edit the
+# generated files — re-pin instead.
+dependencies = [
+  "muse-code-msp @ git+https://github.com/meta-models/muse-code-sdk@4dc252c1a31b02ff676dce0358d297ffbc5d8784#subdirectory=python/clients/msp-py",
+]
 
 [project.urls]
 Homepage = "https://github.com/MTG-Thomas/Mousagetes"

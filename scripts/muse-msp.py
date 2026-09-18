@@ -21,6 +21,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -48,110 +49,57 @@ DAEMON_LOG = RUNTIME / "daemon.log"
 MSP_STREAM_LIMIT = 16 * 1024 * 1024
 
 
-# All 51 MSP methods on the experimental surface (exported via
-# `muse schema generate-json-schema --out DIR --experimental`; the method
-# index plus the parity gate's deferral register is the authoritative list).
-# The generic `call` surface validates against this snapshot before hitting
-# the wire so typos fail fast instead of as daemon round-trip failures.
-MSP_METHODS = frozenset(
-    {
-        "account/loginCancel",
-        "account/loginStart",
-        "account/logout",
-        "account/read",
-        "approval/decide",
-        "approval/listPending",
-        "goal/clear",
-        "goal/edit",
-        "goal/pause",
-        "goal/resume",
-        "goal/set",
-        "initialize",
-        "item/readOutput",
-        "model/list",
-        "session/compact",
-        "session/fork",
-        "session/list",
-        "session/read",
-        "session/rename",
-        "session/resume",
-        "session/setApprovalMode",
-        "session/setModel",
-        "session/setReasoningEffort",
-        "session/start",
-        "session/userShell",
-        "skill/list",
-        "subagent/close",
-        "subagent/followupTask",
-        "subagent/interrupt",
-        "subagent/readResult",
-        "subagent/reopen",
-        "subagent/resume",
-        "subagent/sendMessage",
-        "subagent/stop",
-        "task/background",
-        "task/stop",
-        "task/stopAll",
-        "turn/cancel",
-        "turn/interrupt",
-        "turn/start",
-        "turn/steer",
-        "turn/unqueue",
-        "usage/read",
-        "userInput/answer",
-        "userInput/cancel",
-        "userInput/clarify",
-        "view/page",
-        "view/subscribe",
-        "view/unsubscribe",
-        "workflow/cancel",
-        "workflow/childControl",
-    }
-)
+# MSP wire tables come from Meta's generated `muse-code-msp` package
+# (github.com/meta-models/muse-code-sdk, python/clients/msp-py, rendered
+# from the committed MSP JSON Schema bundles). Never hand-edit the
+# generated files and never hand-maintain these tables here: every name
+# below is derived from the bundle at import time, so a re-pin is the
+# only way the allowlists change. Pinned in pyproject.toml; the update
+# procedure lives in README ("MSP wire types").
+try:
+    from muse_code_msp import METHODS as _STABLE_METHODS
+    from muse_code_msp import NOTIFICATIONS as _STABLE_NOTIFICATIONS
+    from muse_code_msp import SCHEMA_FINGERPRINT as STABLE_SCHEMA_FINGERPRINT
+    from muse_code_msp import experimental as _MSP_WIRE
+except ImportError as exc:
+    raise ImportError(
+        "muse-code-msp is required (pinned in pyproject.toml): "
+        "pip install "
+        "'muse-code-msp @ git+https://github.com/meta-models/muse-code-sdk"
+        "@<sha>#subdirectory=python/clients/msp-py'"
+    ) from exc
 
-# Methods whose params require a client-minted commandId (per the MSP schema's
-# required lists). The generic `call` surface injects one automatically.
-COMMAND_METHODS = frozenset(
-    {
-        "account/loginStart",
-        "approval/decide",
-        "goal/clear",
-        "goal/edit",
-        "goal/pause",
-        "goal/resume",
-        "goal/set",
-        "session/compact",
-        "session/fork",
-        "session/rename",
-        "session/resume",
-        "session/setApprovalMode",
-        "session/setModel",
-        "session/setReasoningEffort",
-        "session/start",
-        "session/userShell",
-        "subagent/close",
-        "subagent/followupTask",
-        "subagent/interrupt",
-        "subagent/readResult",
-        "subagent/reopen",
-        "subagent/resume",
-        "subagent/sendMessage",
-        "subagent/stop",
-        "task/background",
-        "task/stop",
-        "task/stopAll",
-        "turn/cancel",
-        "turn/interrupt",
-        "turn/start",
-        "turn/steer",
-        "turn/unqueue",
-        "userInput/answer",
-        "userInput/cancel",
-        "userInput/clarify",
-        "workflow/cancel",
-        "workflow/childControl",
-    }
-)
+# Method/notification/error tables on the experimental surface (m8s drives
+# `muse serve` with the experimental opt-in). The generic `call` surface
+# validates against MSP_METHODS before hitting the wire so typos fail
+# fast instead of as daemon round-trip failures.
+MSP_METHODS = frozenset(_MSP_WIRE.METHODS)
+MSP_NOTIFICATIONS = _MSP_WIRE.NOTIFICATIONS
+MSP_ERRORS = _MSP_WIRE.ERRORS
+EXPERIMENTAL_SCHEMA_FINGERPRINT = _MSP_WIRE.SCHEMA_FINGERPRINT
+EXPERIMENTAL_SCHEMA_VERSION = _MSP_WIRE.SCHEMA_VERSION
+
+MSP_ERROR_BY_CODE = {spec["code"]: spec for spec in MSP_ERRORS}
+
+
+def _command_methods() -> frozenset[str]:
+    """Methods whose params require a client-minted commandId.
+
+    Derived from the generated params types: a method is a command when
+    `commandId` is a required key of its params TypedDict. The generic
+    `call` surface injects one automatically for these.
+    """
+    commands: set[str] = set()
+    for method, spec in _MSP_WIRE.METHODS.items():
+        params_name = spec.get("params")
+        params_cls = getattr(_MSP_WIRE, params_name, None) if params_name else None
+        required = getattr(params_cls, "__required_keys__", frozenset())
+        if "commandId" in required:
+            commands.add(method)
+    return frozenset(commands)
+
+
+COMMAND_METHODS = _command_methods()
 
 
 __version__ = "0.5.0"
@@ -2080,6 +2028,143 @@ class RetireError(ValueError):
         self.kind = kind
 
 
+class MspWireError(RuntimeError):
+    """Typed host-side error for an MSP error frame.
+
+    Classified against the generated error table (``MSP_ERRORS``): ``kind``
+    is the protocol's ``error.data.kind`` (or the table kind for the
+    numeric code when the frame carries none), ``code`` the JSON-RPC code,
+    and ``retryable`` the table's retry guidance. Subclasses RuntimeError
+    so existing ``except RuntimeError`` handling keeps working; the
+    control boundary already surfaces ``kind`` as ``errorKind``.
+    """
+
+    def __init__(self, kind: str, message: str, code: int | None = None) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.code = code
+        spec = MSP_ERROR_BY_CODE.get(code) if code is not None else None
+        self.retryable = bool(spec and spec["retryable"])
+
+
+def classify_wire_error(error: dict[str, Any]) -> MspWireError:
+    """Classify a JSON-RPC error object via the generated error table.
+
+    Pure function: performs no I/O. Unknown codes fall back to the
+    frame's own ``data.kind`` (or "internal") rather than raising.
+    """
+    if not isinstance(error, dict):
+        return MspWireError("internal", str(error))
+    data = error.get("data")
+    kind = data.get("kind") if isinstance(data, dict) else None
+    code = error.get("code")
+    if not kind and isinstance(code, int):
+        spec = MSP_ERROR_BY_CODE.get(code)
+        kind = spec["kind"] if spec else None
+    message = error.get("message") or json.dumps(error, sort_keys=True)
+    return MspWireError(kind or "internal", str(message), code if isinstance(code, int) else None)
+
+
+class SchemaDriftError(RuntimeError):
+    """The installed `muse` binary's schema cannot be exported.
+
+    Raised at daemon start when `muse schema generate-json-schema` fails,
+    so startup stops with a typed error instead of spawning a host blind.
+    Fingerprint/method drift itself is reported (see check_schema_compat),
+    never raised. ``kind`` is "schemaDrift" so the control boundary
+    surfaces it typed.
+    """
+
+    def __init__(self, message: str, detail: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.kind = "schemaDrift"
+        self.detail = detail or {}
+
+
+def export_host_schema(muse_argv: list[str]) -> dict[str, Any]:
+    """Export the installed binary's MSP schema bundles (offline, instant).
+
+    Runs `muse schema generate-json-schema` for the stable and
+    experimental surfaces and returns each manifest plus its method and
+    notification names. Raises SchemaDriftError when the export fails.
+    """
+    surfaces: dict[str, Any] = {}
+    for name, extra in (("stable", []), ("experimental", ["--experimental"])):
+        with tempfile.TemporaryDirectory(prefix="m8s-schema-") as tmp:
+            try:
+                subprocess.run(
+                    [*muse_argv, "schema", "generate-json-schema", "--out", tmp, *extra],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=True,
+                )
+                manifest = json.loads((Path(tmp) / "manifest.json").read_text(encoding="utf-8"))
+                bundle = json.loads((Path(tmp) / "msp.schema.json").read_text(encoding="utf-8"))
+            except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                raise SchemaDriftError(
+                    f"cannot export {name} MSP schema from {' '.join(muse_argv)}: {exc}"
+                ) from exc
+        surfaces[name] = {
+            "fingerprint": manifest.get("fingerprint"),
+            "schemaVersion": manifest.get("schemaVersion"),
+            "methods": set((bundle.get("methods") or {}).keys()),
+            "notifications": set((bundle.get("notifications") or {}).keys()),
+        }
+    return surfaces
+
+
+def check_schema_compat(surfaces: dict[str, Any]) -> list[dict[str, Any]]:
+    """Compare the host export against the bundle fingerprint constants.
+
+    Returns one drift record per surface; an empty list means exact match
+    on both surfaces. Drift is reported, never fatal — the cookbook
+    posture (sdk-cookbook `fingerprint-mismatch`): a mismatch is a
+    warning, never an error, because additive-optional evolution means an
+    older bundle keeps working against a newer host. A host missing
+    bundled methods is reported as `missingMethods` drift (calls to those
+    methods fail at runtime as typed methodNotFound); it must not brick
+    supervision. SchemaDriftError stays reserved for an export that
+    cannot run at all.
+    """
+    expected = {
+        # The stable bundle is a subset surface (no account/*): compare
+        # each surface against what its own bundle declares.
+        "stable": {
+            "fingerprint": STABLE_SCHEMA_FINGERPRINT,
+            "methods": frozenset(_STABLE_METHODS),
+            "notifications": set(_STABLE_NOTIFICATIONS),
+        },
+        "experimental": {
+            "fingerprint": EXPERIMENTAL_SCHEMA_FINGERPRINT,
+            "methods": MSP_METHODS,
+            "notifications": set(MSP_NOTIFICATIONS),
+        },
+    }
+    drift: list[dict[str, Any]] = []
+    for name in ("stable", "experimental"):
+        want = expected[name]
+        got = surfaces[name]
+        record: dict[str, Any] = {"surface": name}
+        missing_methods = sorted(want["methods"] - got["methods"])
+        if missing_methods:
+            record["missingMethods"] = missing_methods
+        if got["fingerprint"] != want["fingerprint"]:
+            record["fingerprint"] = {"want": want["fingerprint"], "got": got["fingerprint"]}
+        extra_methods = sorted(got["methods"] - want["methods"])
+        if extra_methods:
+            record["extraMethods"] = extra_methods
+        extra_notifications = sorted(got["notifications"] - want["notifications"])
+        if extra_notifications:
+            record["extraNotifications"] = extra_notifications
+        missing_notifications = sorted(want["notifications"] - got["notifications"])
+        if missing_notifications:
+            record["missingNotifications"] = missing_notifications
+        if len(record) > 1:
+            drift.append(record)
+    return drift
+
+
 def validate_call(
     method: str,
     params: dict[str, Any] | None = None,
@@ -2132,7 +2217,27 @@ class MspHost:
         """Argv whose stdio carries this host's `muse serve` frames."""
         return list(SERVE_ARGV)
 
+    def check_host_schema(self) -> list[dict[str, Any]]:
+        """Daemon-start wire gate: host schema vs bundle constants.
+
+        Exports the installed binary's bundles and runs
+        ``check_schema_compat``. Any drift is recorded as a `schema.drift`
+        event and returned; only an un-runnable export raises
+        (SchemaDriftError, no startup). Remote (SSH-carried) hosts skip
+        the local export — the peer-side agent owns its own check — and
+        record `schema.skipped` instead.
+        """
+        argv = self.serve_argv()
+        if not argv or argv[0] != "muse":
+            self.record({"kind": "schema.skipped", "reason": "remoteServeArgv"})
+            return []
+        drift = check_schema_compat(export_host_schema([argv[0]]))
+        if drift:
+            self.record({"kind": "schema.drift", "drift": drift})
+        return drift
+
     async def start(self) -> None:
+        self.check_host_schema()
         self.proc = await asyncio.create_subprocess_exec(
             *self.serve_argv(),
             stdin=asyncio.subprocess.PIPE,
@@ -2259,7 +2364,7 @@ class MspHost:
                 future = self.pending.pop(frame["id"], None)
                 if future and not future.done():
                     if "error" in frame:
-                        future.set_exception(RuntimeError(json.dumps(frame["error"])))
+                        future.set_exception(classify_wire_error(frame["error"]))
                     else:
                         future.set_result(frame.get("result"))
                 continue

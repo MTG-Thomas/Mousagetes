@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+- MSP wire types adopted from Meta's generated `muse-code-msp` package
+  (pinned in `pyproject.toml` to an SDK mirror commit; see README
+  "MSP wire types" for the update procedure). The hand-rolled method
+  and commandId tables are gone: `MSP_METHODS`, `MSP_NOTIFICATIONS`,
+  and `MSP_ERRORS` come from the bundle, `COMMAND_METHODS` is derived
+  from the generated params types (`account/loginStart` no longer
+  auto-mints a `commandId` its schema does not require), and host-side
+  errors arrive typed (`MspWireError` with protocol kind and retry
+  guidance). Daemon start exports the installed `muse` binary's schema
+  and compares fingerprints against the bundle constants, recording any
+  drift as `schema.drift` (warning, never fatal, per the sdk-cookbook
+  `fingerprint-mismatch` posture). Note: the installed binary already serves one
+  notification the pinned bundle lacks (`session/listChanged`), so `up`
+  currently records drift until the mirror catches up.
+
 ## v0.5.0
 - `m8s reload` hot upgrade: the daemon finishes its response, shuts
   down cleanly, and execs the script file fresh, so edited code takes
