@@ -20,6 +20,9 @@ Muse coding sessions over MSP (`muse serve`) and external-agent ingress.
   snapshot compiled into ranked lane specs with deterministic priority
   arbitration, P4-lease collision queuing, decision-blocked paging, and a
   reconcile loop — see [docs/compile.md](docs/compile.md).
+- ACP client surface (planned, m8s v2): drive lanes from ACP clients and
+  phones over a private mesh — see [docs/acp.md](docs/acp.md) and
+  [docs/adr/](docs/adr/README.md).
 
 ## Use
 
