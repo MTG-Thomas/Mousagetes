@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- ACP client surface (m8s v2): a daemon-backed Agent Client Protocol
+  adapter (`scripts/m8s-acp`) so ACP clients and a phone browser can
+  drive m8s-owned Muse lanes. One lane maps to one ACP session; prompts
+  stream `session/update`; approvals and user input relay as
+  `session/request_permission` and `elicitation/create`; model, effort,
+  and approval mode are reachable as slash commands and as mode/model
+  pickers. No filesystem or terminal capabilities are advertised to
+  clients.
+- `scripts/m8s_acp/`: stdlib-only package (JSON-RPC framing, transport,
+  daemon control client, command mapping) plus a transport test stub,
+  with a frozen `LaneMapping` seam between the transport and the mapping.
+- Plan and decisions: `docs/acp.md`, `docs/adr/` (0001-0012), the remote
+  transport runbook `docs/acp-remote.md`, and the client fidelity
+  evaluation `docs/acp-client-eval.md`.
+
 ## v0.5.0
 - `m8s reload` hot upgrade: the daemon finishes its response, shuts
   down cleanly, and execs the script file fresh, so edited code takes
