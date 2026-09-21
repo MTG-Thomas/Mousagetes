@@ -32,21 +32,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          UNRELEASED=$(python3 -c "
-          import re
-          text = open('CHANGELOG.md', encoding='utf-8').read()
-          m = re.search(r'^##\s+Unreleased\s*$(.*?)(?=^##\s+|\Z)', text, re.MULTILINE | re.DOTALL)
-          print((m.group(1).strip() if m else ''))
-          ")
+          # Inline Python stays on one line and avoids '$': this runs inside a
+          # double-quoted shell string, where leading indentation is an
+          # IndentationError and '$(...)' would be command-substituted.
+          UNRELEASED=$(python3 -c "import re; text=open('CHANGELOG.md', encoding='utf-8').read(); m=re.search(r'^##[ \t]+Unreleased[ \t]*\n(.*?)(?=^##[ \t]+|\Z)', text, re.MULTILINE | re.DOTALL); print((m.group(1).strip() if m else ''))")
           if [ -z "$UNRELEASED" ]; then
             echo "Unreleased is empty; nothing to draft."
             exit 0
           fi
-          BASE=$(python3 -c "
-          import re
-          m = re.search(r'^__version__\s*=\s*\"([^\"]+)\"', open('scripts/muse-msp.py').read(), re.MULTILINE)
-          print(m.group(1))
-          ")
+          BASE=$(python3 -c "import re; m=re.search(r'^__version__\s*=\s*\"([^\"]+)\"', open('scripts/muse-msp.py').read(), re.MULTILINE); print(m.group(1))")
           TAG="v$BASE"
           SINCE=$(git log -1 --format=%cI "$TAG" 2>/dev/null || echo "1970-01-01T00:00:00Z")
           LABEL_ARGS=$(gh pr list --state merged --base main --limit 30 \
