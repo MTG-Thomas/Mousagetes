@@ -43,10 +43,13 @@ jobs:
           BASE=$(python3 -c "import re; m=re.search(r'^__version__\s*=\s*\"([^\"]+)\"', open('scripts/muse-msp.py').read(), re.MULTILINE); print(m.group(1))")
           TAG="v$BASE"
           SINCE=$(git log -1 --format=%cI "$TAG" 2>/dev/null || echo "1970-01-01T00:00:00Z")
-          LABEL_ARGS=$(gh pr list --state merged --base main --limit 30 \
-            --json labels,mergedAt \
-            --jq --arg since "$SINCE" \
-            '[.[] | select(.mergedAt > $since) | ([.labels[].name] | join(","))] | .[] | "--pr=\(.)"' \
+          # 'gh pr list --jq' has no '--arg'; filter by merge date with
+          # '--search' and keep the jq expression free of shell metacharacters.
+          SINCE_DATE="${SINCE%%T*}"
+          LABEL_ARGS=$(gh pr list --state merged --base main --limit 100 \
+            --search "merged:>=$SINCE_DATE" \
+            --json labels \
+            --jq '.[] | ([.labels[].name] | join(",")) | "--pr=\(.)"' \
             | tr '\n' ' ')
           if [ -z "$LABEL_ARGS" ]; then
             echo "No merged PRs since $TAG; nothing to draft."
