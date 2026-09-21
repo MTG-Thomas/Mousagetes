@@ -1,7 +1,6 @@
 # Changelog
 
-## Unreleased
-
+## v0.6.0
 - ACP client surface (m8s v2): a daemon-backed Agent Client Protocol
   adapter (`scripts/m8s-acp`) so ACP clients and a phone browser can
   drive m8s-owned Muse lanes. One lane maps to one ACP session; prompts
