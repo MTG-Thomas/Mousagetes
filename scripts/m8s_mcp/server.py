@@ -34,12 +34,13 @@ SERVER_INFO = {"name": "m8s-mcp", "version": __version__}
 TOOL_DESCRIPTIONS = {
     "health": "Check the m8s daemon and this adapter (versions, task counts, modes).",
     "models": "List models available on the m8s host.",
-    "sessions": "Lane metadata without taking any writer lease.",
-    "session_read": "Point-in-time snapshot of a lane; never resumes or steers it.",
+    "sessions": "Lane metadata across both hosts without taking any writer lease.",
+    "session_read": "Point-in-time snapshot of a lane from either host; never resumes or steers it.",
     "start": (
-        "Start an asynchronous lane task. read_only stays approval-gated; "
-        "worktree is the explicit YOLO selection (isolated worktree at the "
-        "exact committed ref). Repeat requestId only after uncertain submission."
+        "Start an asynchronous lane task. read_only runs on the enforced "
+        "host or fails closed; worktree is the explicit YOLO selection "
+        "(isolated worktree at the exact committed ref). Always supply "
+        "requestId; repeat it only after uncertain submission."
     ),
     "tasks": "List tasks owned by this adapter.",
     "status": "Task progress, live preview, and exact pending approvals.",

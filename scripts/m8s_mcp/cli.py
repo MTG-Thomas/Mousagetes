@@ -20,6 +20,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve = sub.add_parser("serve", help="run the daemon-backed MCP adapter over stdio")
     serve.add_argument("--socket", default=None, help="daemon control socket path")
     serve.add_argument(
+        "--read-only-socket",
+        default=None,
+        help="dedicated disable-write/disable-shell daemon socket (required for read_only)",
+    )
+    serve.add_argument(
         "--state-dir", default=None, help="adapter task/worktree state directory"
     )
     return parser
@@ -28,7 +33,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "serve":
-        serve_stdio(Adapter(socket_path=args.socket, state_dir=args.state_dir))
+        serve_stdio(
+            Adapter(
+                socket_path=args.socket,
+                read_only_socket_path=args.read_only_socket,
+                state_dir=args.state_dir,
+            )
+        )
         return 0
     return 2
 

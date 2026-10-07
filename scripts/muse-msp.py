@@ -426,6 +426,24 @@ def repo_activity_ts(workspace: str | None) -> float | None:
 # argv in ssh (see build_ssh_serve_argv); no TCP/port/bind option exists.
 SERVE_ARGV = ("muse", "serve", "--trust-workspace", "--disable-sandbox")
 
+
+def serve_argv() -> list[str]:
+    """Argv this agent uses to spawn its `muse serve` host.
+
+    Overridable in full via `M8S_SERVE_ARGV` (shell-split). This is how a
+    dedicated read-only daemon is configured -- e.g.
+    `M8S_SERVE_ARGV='muse serve --disable-write --disable-shell'` -- on its
+    own runtime dir/socket (see docs/mcp.md). Sandbox posture is fixed per
+    host for its lifetime and is advertised via the `health` control
+    command so clients can verify it instead of assuming it.
+    """
+    raw = os.environ.get("M8S_SERVE_ARGV", "")
+    if raw.strip():
+        import shlex
+
+        return shlex.split(raw)
+    return list(SERVE_ARGV)
+
 HOSTS_FILE = RUNTIME / "hosts.json"
 
 # Liveness TTL for enrolled hosts. Overridable via M8S_HOST_TTL_SECONDS;
@@ -2130,7 +2148,7 @@ class MspHost:
 
     def serve_argv(self) -> list[str]:
         """Argv whose stdio carries this host's `muse serve` frames."""
-        return list(SERVE_ARGV)
+        return serve_argv()
 
     async def start(self) -> None:
         self.proc = await asyncio.create_subprocess_exec(
@@ -3473,7 +3491,12 @@ async def dispatch(host: MspHost, request: dict[str, Any]) -> Any:
             limit = int(request.get("eventsLimit", 2000))
         except (TypeError, ValueError):
             limit = 2000
-        return await host.health(limit)
+        result = await host.health(limit)
+        if isinstance(result, dict):
+            # Advertised sandbox posture: clients verify these flags
+            # instead of assuming what the host enforces.
+            result["serveArgv"] = serve_argv()
+        return result
     if command == "call":
         params = dict(request.get("params") or {})
         if request.get("session"):

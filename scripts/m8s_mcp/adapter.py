@@ -32,18 +32,20 @@ Safety contracts preserved from the installed bridge surface:
   ``mode="worktree"`` selection; the default is the approval-gated
   ``read_only`` posture.
 
-Read-only-host strategy (honest limitation): ``--disable-write`` and
-``--disable-shell`` are ``muse serve`` argv, fixed per host for its
-lifetime, and the shared daemon serves trusted
-(``--trust-workspace --disable-sandbox``). They are not negotiable over
-the wire, so this adapter never claims OS-level tool removal. ``read_only``
-is an approval-gated posture (``onRequest`` plus no worktree plus no
-auto-answer); hard tool removal needs a dedicated read-only daemon host,
-which this adapter can address via ``--socket`` once one exists.
+Read-only enforcement: ``--disable-write`` and ``--disable-shell`` are
+``muse serve`` argv, fixed per host for its lifetime, and the shared
+daemon serves trusted (``--trust-workspace --disable-sandbox``). They are
+not negotiable over the wire, so ``read_only`` starts fail closed with
+``unsupportedReadOnly`` unless a dedicated read-only daemon socket is
+supplied (``--read-only-socket``). That socket's advertised posture is
+verified on every use (both flags must appear in its ``health``
+``serveArgv``), else ``readOnlyMisconfigured``. There is no
+approval-gated fallback: the adapter never silently downgrades.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -51,7 +53,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from m8s_acp.daemon import ControlClient, DaemonError
 
@@ -77,10 +79,13 @@ READ_ONLY_TOOLS = frozenset(
 
 MODES = ("read_only", "worktree")
 
-# Approval posture per start mode. read_only asks on every lane approval
-# request (nothing applies without an explicit approve call); worktree is
-# the explicit YOLO selection (allowAll inside the isolated worktree).
+# Approval posture per start mode. read_only stays ask-on-request even on
+# the enforced host (defense in depth); worktree is the explicit YOLO
+# selection (allowAll inside the isolated worktree).
 APPROVAL_MODE = {"read_only": "onRequest", "worktree": "allowAll"}
+
+# Flags a read-only daemon must advertise in its health serveArgv.
+RO_REQUIRED_FLAGS = ("--disable-write", "--disable-shell")
 
 # At most four live tasks, matching the installed bridge.
 MAX_ACTIVE_TASKS = 4
@@ -237,17 +242,24 @@ class TaskStore:
     def active_count(self) -> int:
         return sum(1 for record in self.all() if record.get("status") in ACTIVE_STATES)
 
-    def reconcile_interruptions(self) -> int:
-        """Mark non-terminal tasks from a dead process interrupted. Returns count."""
-        count = 0
-        for record in self.all():
-            if record.get("status") in ACTIVE_STATES:
-                record["status"] = "interrupted"
-                record["updatedAt"] = _now()
-                record["interruptedReason"] = "adapter restarted; never auto-replayed"
-                self.save(record)
-                count += 1
-        return count
+    @contextlib.contextmanager
+    def locked(self) -> Iterator[None]:
+        """Process- and thread-safe exclusive lock for start's check-then-act.
+
+        Serializes requestId dedup, the active cap, worktree creation,
+        launch, and the first save, so concurrent starts cannot produce
+        two lanes for one request. Held across the daemon round-trip:
+        starts are rare, correctness beats parallelism here.
+        """
+        self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        import fcntl
+
+        with open(self.state_dir / "lock", "a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _now() -> str:
@@ -283,48 +295,164 @@ def _read_text(read: Any) -> str:
 
 
 class Adapter:
-    """The twelve Codex tools. Daemon socket is the only lane channel."""
+    """The twelve Codex tools. Daemon sockets are the only lane channel."""
 
     def __init__(
         self,
         client: ControlClient | None = None,
         *,
         socket_path: str | None = None,
+        read_only_socket_path: str | None = None,
         state_dir: str | Path | None = None,
     ) -> None:
-        self._client = client if client is not None else ControlClient(socket_path)
+        self._rw_client = client if client is not None else ControlClient(socket_path)
+        self._ro_socket = read_only_socket_path
+        self._ro_client = ControlClient(read_only_socket_path) if read_only_socket_path else None
         if state_dir is None:
             state_dir = Path.home() / ".local" / "state" / "m8s-mcp"
         self._store = TaskStore(Path(state_dir))
-        self._store.reconcile_interruptions()
+        self._reconcile()
 
     # -- daemon plumbing -------------------------------------------------
 
-    def _daemon(self, request: dict[str, Any]) -> Any:
+    def _client_for(self, record: dict[str, Any] | None) -> ControlClient:
+        """The owning daemon client for a task (read-write by default).
+
+        Read-only tasks require the dedicated enforced socket; without it
+        the call fails closed instead of reaching the trusted host.
+        """
+        if record is not None and record.get("daemon", "rw") == "ro":
+            if self._ro_client is None:
+                raise _error(
+                    "unsupportedReadOnly",
+                    "read_only task needs --read-only-socket (dedicated "
+                    "disable-write/disable-shell daemon); refusing the trusted host",
+                )
+            return self._ro_client
+        return self._rw_client
+
+    def _daemon(self, request: dict[str, Any], record: dict[str, Any] | None = None) -> Any:
         try:
-            return self._client.request(request)
+            return self._client_for(record).request(request)
         except DaemonError as exc:
             raise _error("daemonDown" if exc.kind is None else str(exc.kind), str(exc)) from exc
 
-    def _call(self, method: str, session: str | None = None, params: dict[str, Any] | None = None) -> Any:
+    def _call(
+        self,
+        method: str,
+        session: str | None = None,
+        params: dict[str, Any] | None = None,
+        record: dict[str, Any] | None = None,
+    ) -> Any:
         request: dict[str, Any] = {"command": "call", "method": method, "commandId": "auto"}
         if session:
             request["session"] = session
         if params:
             request["params"] = params
-        return self._daemon(request)
+        return self._daemon(request, record)
 
-    def _lane(self, session_id: str) -> dict[str, Any] | None:
-        result = self._daemon({"command": "list"}) or {}
+    def _lane(self, session_id: str, record: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        result = self._daemon({"command": "list"}, record) or {}
         for item in result.get("sessions", []) or []:
             if (item.get("sessionId") or item.get("id")) == session_id:
                 return item
         return None
 
-    def _pending(self, session_id: str) -> dict[str, Any]:
-        return self._daemon({"command": "pending", "session": session_id}) or {}
+    def _lanes(self, record: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        result = self._daemon({"command": "list"}, record) or {}
+        return [item for item in result.get("sessions", []) or [] if isinstance(item, dict)]
 
-    def _terminal_for(self, session_id: str, turn_id: str | None) -> dict[str, Any] | None:
+    def _pending(self, session_id: str, record: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._daemon({"command": "pending", "session": session_id}, record) or {}
+
+    def _verify_read_only(self) -> list[str]:
+        """Fail closed unless the read-only socket enforces tool removal.
+
+        Returns the advertised serve argv. Checked on every read_only
+        start and reported by health: posture is verified, never assumed.
+        """
+        if self._ro_client is None:
+            raise _error(
+                "unsupportedReadOnly",
+                "read_only needs --read-only-socket (dedicated "
+                "disable-write/disable-shell daemon); refusing the trusted host",
+            )
+        try:
+            health = self._ro_client.request({"command": "health", "eventsLimit": 1}) or {}
+        except DaemonError as exc:
+            raise _error("daemonDown", f"read-only daemon unreachable: {exc}") from exc
+        argv = health.get("serveArgv") if isinstance(health, dict) else None
+        if not isinstance(argv, list) or any(flag not in argv for flag in RO_REQUIRED_FLAGS):
+            raise _error(
+                "readOnlyMisconfigured",
+                "read-only daemon does not advertise disable-write+disable-shell; refusing start",
+            )
+        return [str(flag) for flag in argv]
+
+    def _enforcement(self, record: dict[str, Any]) -> str:
+        if record.get("daemon", "rw") == "ro":
+            return "enforced-read-only"
+        if record.get("mode") == "read_only":
+            # Pre-enforcement record: launched approval-gated on the
+            # trusted host before fail-closed existed. Visible, not hidden.
+            return "approval-gated-legacy"
+        return "yolo-worktree"
+
+    def _reconcile(self) -> None:
+        """Settle persisted pointers against daemon evidence, not client death.
+
+        A new adapter process (e.g. after a Codex stdio reconnect) must
+        not mistake its own restart for host failure: a task whose
+        admitted turn has a terminal event settles to it; a task whose
+        lane is still supervised stays live; only a lane that is gone
+        with no terminal becomes interrupted (never auto-replayed).
+        """
+        for record in self._store.all():
+            if record.get("status") not in ACTIVE_STATES:
+                continue
+            try:
+                client_record: dict[str, Any] | None = record
+                self._client_for(record)
+            except McpAdapterError:
+                record["status"] = "interrupted"
+                record["updatedAt"] = _now()
+                record["interruptedReason"] = "read-only socket unconfigured at reconcile"
+                self._store.save(record)
+                continue
+            try:
+                terminal = self._terminal_for(
+                    str(record["sessionId"]), record.get("turnId"), client_record
+                )
+            except McpAdapterError:
+                continue  # daemon unreachable: leave pointers untouched
+            if terminal is not None:
+                self._settle(record, terminal)
+                continue
+            try:
+                lane = self._lane(str(record["sessionId"]), client_record)
+            except McpAdapterError:
+                continue
+            if lane is None:
+                record["status"] = "interrupted"
+                record["updatedAt"] = _now()
+                record["interruptedReason"] = "lane gone with no terminal for the admitted turn"
+                self._store.save(record)
+            elif not record.get("recovered"):
+                record["recovered"] = True
+                record["updatedAt"] = _now()
+                self._store.save(record)
+
+    def _settle(self, record: dict[str, Any], terminal: dict[str, Any]) -> None:
+        kind = terminal.get("terminal") or "completed"
+        record["status"] = "completed" if kind == "completed" else kind
+        record["terminal"] = terminal
+        record["finishedAt"] = _now()
+        record["updatedAt"] = _now()
+        self._store.save(record)
+
+    def _terminal_for(
+        self, session_id: str, turn_id: str | None, record: dict[str, Any] | None = None
+    ) -> dict[str, Any] | None:
         """The turn/completed record for the admitted turn, else None.
 
         Scans daemon events newest-first; a terminal for any other turn —
@@ -333,14 +461,14 @@ class Adapter:
         """
         if not turn_id:
             return None
-        result = self._daemon({"command": "events", "after": 0, "limit": EVENTS_SCAN}) or {}
-        for record in reversed(result.get("events", []) or []):
-            if not isinstance(record, dict):
+        result = self._daemon({"command": "events", "after": 0, "limit": EVENTS_SCAN}, record) or {}
+        for event in reversed(result.get("events", []) or []):
+            if not isinstance(event, dict):
                 continue
-            if record.get("kind") == "msp.event" and record.get("method") == "turn/completed":
-                params = record.get("params") or {}
-            elif record.get("kind") == "turn/completed":
-                params = record
+            if event.get("kind") == "msp.event" and event.get("method") == "turn/completed":
+                params = event.get("params") or {}
+            elif event.get("kind") == "turn/completed":
+                params = event
             else:
                 continue
             if params.get("sessionId") != session_id or str(params.get("turnId")) != str(turn_id):
@@ -348,9 +476,11 @@ class Adapter:
             return params
         return None
 
-    def _transcript_tail(self, session_id: str) -> tuple[str, bool]:
+    def _transcript_tail(
+        self, session_id: str, record: dict[str, Any] | None = None
+    ) -> tuple[str, bool]:
         try:
-            read = self._call("session/read", session_id) or {}
+            read = self._call("session/read", session_id, None, record) or {}
         except McpAdapterError:
             return "", False
         text = _read_text(read)
@@ -361,6 +491,21 @@ class Adapter:
     def health(self) -> dict[str, Any]:
         daemon = self._daemon({"command": "health", "eventsLimit": 50}) or {}
         owned = self._store.all()
+        read_only: dict[str, Any] = {
+            "configured": self._ro_client is not None,
+            "socket": self._ro_socket,
+            "enforced": None,
+            "serveArgv": None,
+        }
+        if self._ro_client is not None:
+            try:
+                argv = self._verify_read_only()
+            except McpAdapterError as exc:
+                read_only["enforced"] = False
+                read_only["error"] = str(exc)
+            else:
+                read_only["enforced"] = True
+                read_only["serveArgv"] = argv
         return {
             "adapter": "m8s-mcp",
             "daemon": {key: daemon.get(key) for key in ("ok", "sessions", "hosts") if key in daemon}
@@ -368,35 +513,46 @@ class Adapter:
             "taskCount": len(owned),
             "activeTasks": sum(1 for task in owned if task.get("status") in ACTIVE_STATES),
             "modes": list(MODES),
-            "readOnlyEnforcement": (
-                "approval-gated only: shared daemon serves trusted; "
-                "--disable-write/--disable-shell are per-host serve argv, "
-                "not negotiable over the wire"
-            ),
+            "readOnly": read_only,
         }
 
     def models(self) -> dict[str, Any]:
         return {"models": self._call("model/list") or []}
 
+    def _roster(self, owner: dict[str, Any] | None) -> list[dict[str, Any]]:
+        result = self._daemon({"command": "list"}, owner) or {}
+        return [item for item in result.get("sessions", []) or [] if isinstance(item, dict)]
+
     def sessions(self, workspace: str | None = None, limit: int = 20, cursor: str | None = None) -> dict[str, Any]:
-        """Lane metadata only. Never resumes, sends, or adopts: no lease."""
+        """Lane metadata across both hosts. Never resumes, sends, or adopts: no lease."""
         if limit < 1 or limit > 100:
             raise _error("badArgument", "limit must be 1..100")
-        result = self._daemon({"command": "list"}) or {}
+        owners: list[tuple[dict[str, Any] | None, str]] = [(None, "rw")]
+        if self._ro_client is not None:
+            owners.append(({"daemon": "ro"}, "ro"))
         items = []
-        for item in result.get("sessions", []) or []:
-            if workspace and item.get("workspace") != workspace:
-                continue
-            items.append(
-                {
-                    "sessionId": item.get("sessionId") or item.get("id"),
-                    "alias": item.get("alias") or item.get("name"),
-                    "workspace": item.get("workspace"),
-                    "status": item.get("status"),
-                    "modelId": item.get("modelId"),
-                    "lastActivity": item.get("lastActivity"),
-                }
-            )
+        for owner, tag in owners:
+            try:
+                lanes = self._roster(owner)
+            except McpAdapterError as exc:
+                if tag == "ro":
+                    items.append({"daemon": tag, "error": str(exc)})
+                    continue
+                raise
+            for item in lanes:
+                if workspace and item.get("workspace") != workspace:
+                    continue
+                items.append(
+                    {
+                        "sessionId": item.get("sessionId") or item.get("id"),
+                        "daemon": tag,
+                        "alias": item.get("alias") or item.get("name"),
+                        "workspace": item.get("workspace"),
+                        "status": item.get("status"),
+                        "modelId": item.get("modelId"),
+                        "lastActivity": item.get("lastActivity"),
+                    }
+                )
         if cursor:
             try:
                 offset = int(cursor)
@@ -410,13 +566,26 @@ class Adapter:
         return out
 
     def session_read(self, session_id: str, include_items: bool = False) -> dict[str, Any]:
-        """Point-in-time snapshot. Does not resume or take the writer lease."""
+        """Point-in-time snapshot from either host. Never resumes or takes a lease."""
         if not isinstance(session_id, str) or not session_id:
             raise _error("badArgument", "sessionId must be a non-empty string")
-        read = self._call("session/read", session_id) or {}
-        out: dict[str, Any] = {"sessionId": session_id, "snapshot": read}
+        try:
+            return self._session_read_on(None, session_id, include_items, "rw")
+        except McpAdapterError as rw_exc:
+            if self._ro_client is None:
+                raise
+            try:
+                return self._session_read_on({"daemon": "ro"}, session_id, include_items, "ro")
+            except McpAdapterError:
+                raise rw_exc from None
+
+    def _session_read_on(
+        self, owner: dict[str, Any] | None, session_id: str, include_items: bool, tag: str
+    ) -> dict[str, Any]:
+        read = self._call("session/read", session_id, None, owner) or {}
+        out: dict[str, Any] = {"sessionId": session_id, "daemon": tag, "snapshot": read}
         if include_items:
-            page = self._call("view/page", session_id, {"limit": 50}) or {}
+            page = self._call("view/page", session_id, {"limit": 50}, owner) or {}
             out["items"] = page.get("events", [])
         return out
 
@@ -449,10 +618,13 @@ class Adapter:
         """Submit an asynchronous lane task. Returns the task id.
 
         ``mode="worktree"`` is the explicit YOLO selection: it launches
-        with ``allowAll`` inside a fresh detached worktree. The default
-        ``read_only`` stays approval-gated (``onRequest``) in the source
-        checkout. Repeating a ``requestId`` with identical inputs replays
-        the existing task; changed inputs reject.
+        with ``allowAll`` inside a fresh detached worktree on the trusted
+        host. The default ``read_only`` launches on the dedicated enforced
+        host only, and fails closed (``unsupportedReadOnly`` /
+        ``readOnlyMisconfigured``) otherwise -- never approval-gated on
+        the trusted host. Repeating a ``requestId`` with identical inputs
+        replays the existing task; changed inputs reject. Always supply a
+        ``requestId``: it is what makes an uncertain retry safe.
         """
         if not isinstance(workspace, str) or not workspace:
             raise _error("badArgument", "workspace must be a non-empty string")
@@ -465,14 +637,35 @@ class Adapter:
         if not isinstance(ref, str) or not ref:
             raise _error("badArgument", "ref must be a non-empty string")
         request_uuid = _parse_uuid(request_id, "requestId") if request_id is not None else None
+        daemon = "ro" if mode == "read_only" else "rw"
+        if daemon == "ro":
+            # Fail closed before any lane, worktree, or record exists.
+            self._verify_read_only()
 
         source = _verify_workspace(workspace)
         commit = _resolve_ref(source, ref)
 
+        with self._store.locked():
+            return self._start_locked(
+                source, prompt, mode, model, ref, commit, daemon, request_uuid
+            )
+
+    def _start_locked(
+        self,
+        source: Path,
+        prompt: str,
+        mode: str,
+        model: str | None,
+        ref: str,
+        commit: str,
+        daemon: str,
+        request_uuid: str | None,
+    ) -> dict[str, Any]:
+        store = self._store
+        fingerprint = _fingerprint(str(source), prompt, mode, model, commit)
         if request_uuid is not None:
-            existing = self._store.find_by_request(request_uuid)
+            existing = store.find_by_request(request_uuid)
             if existing is not None:
-                fingerprint = _fingerprint(str(source), prompt, mode, model, commit)
                 if existing.get("fingerprint") != fingerprint:
                     raise _error(
                         "duplicateRequestId",
@@ -482,20 +675,23 @@ class Adapter:
         else:
             request_uuid = str(uuid.uuid4())
 
-        if self._store.active_count() >= MAX_ACTIVE_TASKS:
+        if store.active_count() >= MAX_ACTIVE_TASKS:
             raise _error("tooManyActive", f"at most {MAX_ACTIVE_TASKS} tasks may be active")
 
         task_id = str(uuid.uuid4())
         lane_workspace = str(source)
         worktree: str | None = None
         if mode == "worktree":
-            worktree = str(self._store.worktrees_dir / task_id)
+            worktree = str(store.worktrees_dir / task_id)
             # Detached worktree at the exact committed SHA: dirty source
             # files are never copied, the source checkout stays untouched.
             _run_git(source, "worktree", "add", "--detach", worktree, commit)
             lane_workspace = worktree
 
-        alias = f"mcp-{task_id[:8]}"
+        # The alias derives from the requestId when one is supplied, so an
+        # uncertain retry (lost receipt, lane already created) finds and
+        # adopts its orphan instead of launching a second lane.
+        alias = f"mcp-{uuid.UUID(request_uuid).hex[:8]}"
         launch: dict[str, Any] = {
             "command": "launch",
             "name": alias,
@@ -505,12 +701,16 @@ class Adapter:
         }
         if model:
             launch["model"] = model
+        owner: dict[str, Any] | None = {"daemon": daemon}
         try:
-            launched = self._daemon(launch) or {}
+            launched = self._daemon(launch, owner) or {}
         except McpAdapterError:
-            if worktree is not None:
-                _remove_worktree(source, worktree)
-            raise
+            adopted = self._adopt_orphan(owner, alias)
+            if adopted is None:
+                if worktree is not None:
+                    _remove_worktree(source, worktree)
+                raise
+            launched = adopted
         session = launched.get("session") or {}
         session_id = session.get("sessionId") or session.get("id")
         if not session_id:
@@ -519,10 +719,13 @@ class Adapter:
             raise _error("launchFailed", "daemon launch returned no session id")
         turn = launched.get("turn") or {}
         turn_id = turn.get("turnId")
+        if not turn_id and isinstance(launched.get("session"), dict):
+            turn_id = (session.get("activeTurn") or session.get("activeTurnId"))
         record = {
             "taskId": task_id,
             "requestId": request_uuid,
-            "fingerprint": _fingerprint(str(source), prompt, mode, model, commit),
+            "fingerprint": fingerprint,
+            "daemon": daemon,
             "sessionId": str(session_id),
             "alias": alias,
             "mode": mode,
@@ -539,8 +742,35 @@ class Adapter:
             "createdAt": _now(),
             "updatedAt": _now(),
         }
-        self._store.save(record)
+        store.save(record)
         return {"taskId": task_id, "sessionId": str(session_id)}
+
+    def _adopt_orphan(
+        self, owner: dict[str, Any], alias: str
+    ) -> dict[str, Any] | None:
+        """Bind the lane an uncertain launch left behind, if any.
+
+        When a launch receipt is lost after the daemon created the lane,
+        the lane sits under our deterministic alias. Adopt it (session
+        plus live turn) instead of launching a duplicate. Returns None
+        when no such lane exists or the daemon cannot even be listed, in
+        which case the original error propagates.
+        """
+        try:
+            lanes = self._lanes(owner)
+        except McpAdapterError:
+            return None
+        for lane in lanes:
+            if lane.get("alias") == alias:
+                session_id = lane.get("sessionId") or lane.get("id")
+                if not session_id:
+                    continue
+                return {
+                    "session": lane,
+                    "turn": {"turnId": lane.get("activeTurnId")},
+                    "adoptedOrphan": True,
+                }
+        return None
 
     # -- progress and terminal evidence -------------------------------------
 
@@ -550,15 +780,17 @@ class Adapter:
 
     def _progress(self, record: dict[str, Any]) -> dict[str, Any]:
         session_id = str(record["sessionId"])
-        lane = self._lane(session_id)
+        lane = self._lane(session_id, record)
         pending: dict[str, Any] = {}
         if lane is not None:
             try:
-                pending = self._pending(session_id)
+                pending = self._pending(session_id, record)
             except McpAdapterError:
                 pending = {}
         approvals = pending.get("approvals", []) if isinstance(pending, dict) else []
-        preview, truncated = self._transcript_tail(session_id) if lane is not None else ("", False)
+        preview, truncated = (
+            self._transcript_tail(session_id, record) if lane is not None else ("", False)
+        )
         status = record.get("status")
         if status in ACTIVE_STATES and lane is not None:
             status = "awaiting_approval" if approvals else "running"
@@ -566,6 +798,7 @@ class Adapter:
             "taskId": record["taskId"],
             "status": status,
             "mode": record.get("mode"),
+            "enforcement": self._enforcement(record),
             "sessionId": session_id,
             "turnId": record.get("turnId"),
             "lanePresent": lane is not None,
@@ -597,7 +830,7 @@ class Adapter:
                 "terminal": None,
                 "note": "adapter restarted; never auto-replayed; use resume explicitly",
             }
-        terminal = self._terminal_for(str(record["sessionId"]), record.get("turnId"))
+        terminal = self._terminal_for(str(record["sessionId"]), record.get("turnId"), record)
         if terminal is None:
             progress = self._progress(record)
             return {
@@ -607,14 +840,9 @@ class Adapter:
                 "note": "turn still live; a returned answer or accepted cancel is not terminal proof",
                 "approvals": progress["approvals"],
             }
-        kind = terminal.get("terminal") or "completed"
-        status = "completed" if kind == "completed" else kind
-        record["status"] = status
-        record["terminal"] = terminal
-        record["finishedAt"] = _now()
-        record["updatedAt"] = _now()
-        self._store.save(record)
-        preview, truncated = self._transcript_tail(str(record["sessionId"]))
+        self._settle(record, terminal)
+        preview, truncated = self._transcript_tail(str(record["sessionId"]), record)
+        status = record["status"]
         return {
             "taskId": task_id,
             "status": status,
@@ -628,13 +856,16 @@ class Adapter:
         record = self._owned(task_id)
         prompt = _require_str({"prompt": prompt}, "prompt")
         session_id = str(record["sessionId"])
-        if self._lane(session_id) is None:
+        if self._lane(session_id, record) is None:
             raise _error("laneGone", "lane is no longer supervised by the daemon")
-        if self._terminal_for(session_id, record.get("turnId")) is None and record.get("status") in ACTIVE_STATES:
-            lane = self._lane(session_id) or {}
+        if (
+            self._terminal_for(session_id, record.get("turnId"), record) is None
+            and record.get("status") in ACTIVE_STATES
+        ):
+            lane = self._lane(session_id, record) or {}
             if lane.get("activeTurnId"):
                 raise _error("turnBusy", "lane still has an active turn; wait or cancel first")
-        sent = self._daemon({"command": "send", "session": session_id, "prompt": prompt}) or {}
+        sent = self._daemon({"command": "send", "session": session_id, "prompt": prompt}, record) or {}
         turn_id = sent.get("turnId")
         if turn_id:
             record["turnId"] = str(turn_id)
@@ -668,7 +899,7 @@ class Adapter:
         for field, value in (("approvalId", approval_id), ("choiceId", choice_id)):
             if not isinstance(value, str) or not value:
                 raise _error("badArgument", f"{field} must be a non-empty string")
-        pending = self._pending(session_id)
+        pending = self._pending(session_id, record)
         approvals = pending.get("approvals", []) if isinstance(pending, dict) else []
         offered = next(
             (item for item in approvals if isinstance(item, dict) and item.get("approvalId") == approval_id),
@@ -688,6 +919,7 @@ class Adapter:
             "approval/decide",
             session_id,
             {"approvalId": approval_id, "requirementId": current, "choiceId": choice_id},
+            record,
         )
         return {"taskId": task_id, "approvalId": approval_id, "decided": decided}
 
@@ -701,9 +933,9 @@ class Adapter:
         """
         record = self._owned(task_id)
         session_id = str(record["sessionId"])
-        if self._lane(session_id) is None:
+        if self._lane(session_id, record) is None:
             raise _error("laneGone", "lane is no longer supervised by the daemon")
-        self._call("turn/cancel", session_id)
+        self._call("turn/cancel", session_id, None, record)
         record["cancelRequested"] = True
         record["updatedAt"] = _now()
         self._store.save(record)
