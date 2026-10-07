@@ -2099,17 +2099,19 @@ def approval_offered_choices(approval: Any) -> set[str] | None:
     """Offered ``availableChoices`` ids, or None when nothing constrains us.
 
     Normalizes string entries and dicts carrying ``choiceId``/``id``. A
-    missing, non-list, or empty ``availableChoices`` means the record
+    missing or empty ``availableChoices`` means the record
     advertises no constraint, so the decide passes through unchecked
     (preserves the documented checked-caller flow for servers that do not
-    advertise choices). Malformed entries are skipped; an advertised list
-    that normalizes to nothing also passes through.
+    advertise choices). Malformed entries are skipped; an explicitly
+    malformed constraint never disables the membership check.
     """
     if not isinstance(approval, dict):
         return None
     raw = approval.get("availableChoices")
-    if raw is None or not isinstance(raw, list) or not raw:
+    if raw is None or raw == []:
         return None
+    if not isinstance(raw, list):
+        return set()
     offered: set[str] = set()
     for choice in raw:
         if isinstance(choice, str):
@@ -2121,7 +2123,9 @@ def approval_offered_choices(approval: Any) -> set[str] | None:
                 cid = choice.get("id")
             if cid is not None and str(cid):
                 offered.add(str(cid))
-    return offered or None
+    # An explicitly advertised but malformed list must never disable the
+    # membership check. Only a missing or empty list means unconstrained.
+    return offered
 
 
 def find_pending_approval(pending_result: Any, approval_id: str) -> dict[str, Any] | None:
@@ -3019,13 +3023,16 @@ class MspHost:
         if command_id != "off" and method in COMMAND_METHODS and "commandId" not in merged:
             merged["commandId"] = uuid7() if command_id in (None, "auto") else command_id
         session_id = merged.get("sessionId")
-        if method == "approval/decide" and session_id:
+        if method == "approval/decide":
             approval_id = merged.get("approvalId")
             choice_id = merged.get("choiceId")
-            if approval_id and choice_id:
-                await self.check_approval_choice(
-                    str(session_id), str(approval_id), str(choice_id)
-                )
+            if not isinstance(session_id, str) or not session_id:
+                raise ApprovalError("approvalNotFound", "approval/decide requires sessionId")
+            if not isinstance(approval_id, str) or not approval_id:
+                raise ApprovalError("approvalNotFound", "approval/decide requires approvalId")
+            if not isinstance(choice_id, str) or not choice_id:
+                raise ApprovalError("invalidChoice", "approval/decide requires choiceId")
+            await self.check_approval_choice(session_id, approval_id, choice_id)
         if session_id:
             if session_id in self._retired_ids():
                 raise RetireError(

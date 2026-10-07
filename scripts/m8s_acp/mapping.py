@@ -419,7 +419,13 @@ class DaemonMapping(contract.LaneMapping):
             return
         context = self._pending_context.get(key, {})
         approval_id = str(context.get("approvalId") or request_id)
-        self._check_approval_choice(lane_id, approval_id, str(option_id))
+        try:
+            self._check_approval_choice(lane_id, approval_id, str(option_id))
+        except DaemonError:
+            # The ACP client may have answered from a stale prompt. Let a
+            # subsequent pending read present the still-live request again.
+            self._emitted_permissions.discard(key)
+            raise
         requirement_id = context.get("requirementId")
         if requirement_id is None:
             requirement_id = self._lookup_requirement(lane_id, approval_id)
@@ -429,7 +435,11 @@ class DaemonMapping(contract.LaneMapping):
         }
         if requirement_id is not None:
             params["requirementId"] = requirement_id
-        self._call_method("approval/decide", lane_id, params)
+        try:
+            self._call_method("approval/decide", lane_id, params)
+        except DaemonError:
+            self._emitted_permissions.discard(key)
+            raise
         self._answered_permissions.add(key)
 
     def answer_question(self, lane_id: str, request_id: str, text: str) -> None:
@@ -847,8 +857,7 @@ class DaemonMapping(contract.LaneMapping):
         self._emitted_permissions.add(key)
         self._pending_context[key] = {
             "approvalId": request_id,
-            "requirementId": approval.get("currentRequirementId")
-            or approval.get("requirementId"),
+            "requirementId": approval.get("currentRequirementId", approval.get("requirementId")),
         }
         return contract.MappingEvent(
             contract.PERMISSION,
@@ -1140,8 +1149,10 @@ def _offered_choice_ids(approval: Any) -> set[str] | None:
     if not isinstance(approval, dict):
         return None
     raw = approval.get("availableChoices")
-    if raw is None or not isinstance(raw, list) or not raw:
+    if raw is None or raw == []:
         return None
+    if not isinstance(raw, list):
+        return set()
     offered: set[str] = set()
     for choice in raw:
         if isinstance(choice, str):
@@ -1153,7 +1164,7 @@ def _offered_choice_ids(approval: Any) -> set[str] | None:
                 cid = choice.get("id")
             if cid is not None and str(cid):
                 offered.add(str(cid))
-    return offered or None
+    return offered
 
 
 def _find_approval(pending_result: Any, approval_id: str) -> dict[str, Any] | None:

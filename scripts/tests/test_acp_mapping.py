@@ -800,8 +800,13 @@ class ApprovalChoiceValidationTest(unittest.TestCase):
 
     def test_refused_choice_leaves_request_answerable(self) -> None:
         mapping, fake = make_mapping(self._handler([dict(self.OFFERED)]))
+        first = mapping._permission_event("s1", dict(self.OFFERED))
+        self.assertIsNotNone(first)
         with self.assertRaises(ApprovalChoiceError):
             mapping.answer_permission("s1", "a1", "maybe")
+        # The mapping must offer the request again after the ACP client
+        # supplies a stale choice; otherwise the live approval is stranded.
+        self.assertIsNotNone(mapping._permission_event("s1", dict(self.OFFERED)))
         mapping.answer_permission("s1", "a1", "deny")
         self.assertEqual(fake.count("approval/decide"), 1)
         decision = next(c for c in fake.calls if c.get("method") == "approval/decide")

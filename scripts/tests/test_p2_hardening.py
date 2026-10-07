@@ -533,8 +533,31 @@ class ApprovalChoiceTest(unittest.TestCase):
         )
         self.assertIsNone(muse_msp.approval_offered_choices({"approvalId": "a1"}))
         self.assertIsNone(muse_msp.approval_offered_choices({"availableChoices": []}))
-        self.assertIsNone(muse_msp.approval_offered_choices({"availableChoices": [42, {}]}))
+        self.assertEqual(muse_msp.approval_offered_choices({"availableChoices": [42, {}]}), set())
         self.assertIsNone(muse_msp.approval_offered_choices(None))
+
+    def test_malformed_advertised_choices_never_decide(self) -> None:
+        host = ApprovalHost([{"approvalId": "a1", "availableChoices": [42, {}]}])
+        with self.assertRaises(muse_msp.ApprovalError) as ctx:
+            decide(host)
+        self.assertEqual(ctx.exception.kind, "invalidChoice")
+        self.assertEqual(host.decide_calls(), [])
+
+    def test_falsey_decide_identifiers_never_reach_wire(self) -> None:
+        host = ApprovalHost([{"approvalId": "a1", "availableChoices": ["allow"]}])
+        for field, value, kind in (
+            ("sessionId", "", "approvalNotFound"),
+            ("approvalId", "", "approvalNotFound"),
+            ("choiceId", "", "invalidChoice"),
+            ("choiceId", None, "invalidChoice"),
+        ):
+            with self.subTest(field=field, value=value):
+                params = {"sessionId": "session-1", "approvalId": "a1", "choiceId": "allow"}
+                params[field] = value
+                with self.assertRaises(muse_msp.ApprovalError) as ctx:
+                    asyncio.run(host.supervised_call("approval/decide", params))
+                self.assertEqual(ctx.exception.kind, kind)
+        self.assertEqual(host.decide_calls(), [])
 
     def test_find_pending_approval_shapes(self) -> None:
         approval = {"approvalId": "a1"}
