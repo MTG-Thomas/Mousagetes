@@ -110,6 +110,15 @@ class TurnFailedError(DaemonError):
     """The lane's turn reached a terminal ``failed`` state."""
 
 
+class ApprovalChoiceError(DaemonError):
+    """Stale or un-offered approval choice: no ``approval/decide`` was sent.
+
+    ``kind`` is "approvalNotFound" (the approval is absent from the current
+    pending listing — stale state, fail closed) or "invalidChoice" (the
+    choice is not in the currently offered ``availableChoices``).
+    """
+
+
 def _command(name: str, description: str, hint: str = "") -> dict[str, Any]:
     descriptor: dict[str, Any] = {"name": name, "description": description}
     if hint:
@@ -410,6 +419,7 @@ class DaemonMapping(contract.LaneMapping):
             return
         context = self._pending_context.get(key, {})
         approval_id = str(context.get("approvalId") or request_id)
+        self._check_approval_choice(lane_id, approval_id, str(option_id))
         requirement_id = context.get("requirementId")
         if requirement_id is None:
             requirement_id = self._lookup_requirement(lane_id, approval_id)
@@ -893,6 +903,37 @@ class DaemonMapping(contract.LaneMapping):
                 return str(requirement) if requirement is not None else None
         return None
 
+    def _check_approval_choice(
+        self, lane_id: str, approval_id: str, option_id: str
+    ) -> None:
+        """Validate an option against the currently offered choices.
+
+        Raises ApprovalChoiceError before any ``approval/decide`` wire call:
+        "approvalNotFound" when the approval is absent from the current
+        pending listing (stale state, fail closed), "invalidChoice" when the
+        option is not currently offered. A record that advertises no
+        constraint (missing/empty ``availableChoices``) passes through, so
+        already-checked callers offering only valid choices are unaffected.
+        A pending-read failure propagates with no decide sent (fail closed),
+        and a refused choice is never recorded as answered, so a later
+        valid choice for the same request can still go through.
+        """
+        result = self._call({"command": "pending", "session": lane_id}) or {}
+        approval = _find_approval(result, approval_id)
+        if approval is None:
+            raise ApprovalChoiceError(
+                f"approval {approval_id!r} is not pending on {lane_id!r}; "
+                "refusing a stale decide",
+                kind="approvalNotFound",
+            )
+        offered = _offered_choice_ids(approval)
+        if offered is not None and option_id not in offered:
+            raise ApprovalChoiceError(
+                f"choice {option_id!r} is not in the offered choices "
+                f"{sorted(offered)} for approval {approval_id!r}",
+                kind="invalidChoice",
+            )
+
 
 # ---------------------------------------------------------------------------
 # Translation helpers (module-level so they are easy to unit test).
@@ -1087,6 +1128,51 @@ def _tool_call_from_approval(
     if locations:
         tool_call["locations"] = locations
     return tool_call
+
+
+def _offered_choice_ids(approval: Any) -> set[str] | None:
+    """Offered choice ids, or None when the record advertises no constraint.
+
+    Mirrors the daemon's ``approval_offered_choices``: missing/empty
+    ``availableChoices`` passes through so already-checked callers are
+    unaffected; malformed entries are skipped.
+    """
+    if not isinstance(approval, dict):
+        return None
+    raw = approval.get("availableChoices")
+    if raw is None or not isinstance(raw, list) or not raw:
+        return None
+    offered: set[str] = set()
+    for choice in raw:
+        if isinstance(choice, str):
+            if choice:
+                offered.add(choice)
+        elif isinstance(choice, dict):
+            cid = choice.get("choiceId")
+            if cid is None:
+                cid = choice.get("id")
+            if cid is not None and str(cid):
+                offered.add(str(cid))
+    return offered or None
+
+
+def _find_approval(pending_result: Any, approval_id: str) -> dict[str, Any] | None:
+    """Find one approval by id in a pending/listing result, else None."""
+    if not isinstance(pending_result, dict):
+        return None
+    for key in ("approvals", "pendingApprovals", "pending"):
+        entries = pending_result.get(key)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            candidate = entry.get("approvalId")
+            if candidate is None:
+                candidate = entry.get("requestId") or entry.get("id")
+            if candidate is not None and str(candidate) == approval_id:
+                return entry
+    return None
 
 
 def _options_from_approval(approval: dict[str, Any]) -> list[dict[str, Any]]:

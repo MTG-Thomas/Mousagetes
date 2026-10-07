@@ -24,6 +24,7 @@ from m8s_acp import contract  # noqa: E402
 from m8s_acp.daemon import ControlClient, DaemonError  # noqa: E402
 from m8s_acp.mapping import (  # noqa: E402
     NEW_SESSION_BRIEF,
+    ApprovalChoiceError,
     DaemonMapping,
     TurnFailedError,
     TurnTimeoutError,
@@ -756,6 +757,60 @@ class PermissionTest(unittest.TestCase):
         mapping, _ = make_mapping(self._handler(), max_polls=3)
         events = list(mapping.prompt("s1", "clean up"))
         self.assertEqual(sum(1 for e in events if e.kind == contract.PERMISSION), 1)
+
+
+class ApprovalChoiceValidationTest(unittest.TestCase):
+    """choiceId is checked against the current listing (issue #34)."""
+
+    OFFERED = {
+        "approvalId": "a1",
+        "currentRequirementId": "r1",
+        "availableChoices": [
+            {"choiceId": "allow", "label": "Allow once"},
+            {"choiceId": "deny", "label": "Reject"},
+        ],
+    }
+
+    def _handler(self, approvals):
+        def handler(request):
+            if request.get("command") == "pending":
+                return {"approvals": approvals, "userInputs": []}
+            return {}
+
+        return handler
+
+    def test_valid_choice_sends_decide(self) -> None:
+        mapping, fake = make_mapping(self._handler([dict(self.OFFERED)]))
+        mapping.answer_permission("s1", "a1", "allow")
+        self.assertEqual(fake.count("approval/decide"), 1)
+
+    def test_invalid_choice_is_typed_with_no_wire_decide(self) -> None:
+        mapping, fake = make_mapping(self._handler([dict(self.OFFERED)]))
+        with self.assertRaises(ApprovalChoiceError) as ctx:
+            mapping.answer_permission("s1", "a1", "maybe")
+        self.assertEqual(ctx.exception.kind, "invalidChoice")
+        self.assertEqual(fake.count("approval/decide"), 0)
+
+    def test_stale_approval_fails_closed_with_no_wire_decide(self) -> None:
+        mapping, fake = make_mapping(self._handler([]))
+        with self.assertRaises(ApprovalChoiceError) as ctx:
+            mapping.answer_permission("s1", "a1", "allow")
+        self.assertEqual(ctx.exception.kind, "approvalNotFound")
+        self.assertEqual(fake.count("approval/decide"), 0)
+
+    def test_refused_choice_leaves_request_answerable(self) -> None:
+        mapping, fake = make_mapping(self._handler([dict(self.OFFERED)]))
+        with self.assertRaises(ApprovalChoiceError):
+            mapping.answer_permission("s1", "a1", "maybe")
+        mapping.answer_permission("s1", "a1", "deny")
+        self.assertEqual(fake.count("approval/decide"), 1)
+        decision = next(c for c in fake.calls if c.get("method") == "approval/decide")
+        self.assertEqual(decision["params"]["choiceId"], "deny")
+
+    def test_unadvertised_choices_pass_through(self) -> None:
+        mapping, fake = make_mapping(self._handler([{"approvalId": "a1"}]))
+        mapping.answer_permission("s1", "a1", "allow")
+        self.assertEqual(fake.count("approval/decide"), 1)
 
 
 class QuestionTest(unittest.TestCase):
