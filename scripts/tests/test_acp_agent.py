@@ -424,9 +424,7 @@ class CancelTests(unittest.TestCase):
             response("m8s-1", {"outcome": {"outcome": "cancelled"}}),
         )
         self.assertEqual(mapping.cancelled, ["lane-1"])
-        self.assertEqual(
-            mapping.permission_answers, [("lane-1", "perm-1", "cancelled")]
-        )
+        self.assertEqual(mapping.permission_answers, [])
         self.assertEqual(by_id(messages, 1)["result"]["stopReason"], "cancelled")
 
 
