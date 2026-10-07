@@ -52,7 +52,23 @@ identical inputs replays the existing task, changed inputs reject, and
 it is what makes an uncertain retry safe (the lane alias derives from
 it, so a lost receipt adopts its orphan instead of launching twice).
 Starts hold an exclusive registry lock across dedup, cap, worktree,
-launch, and save, so concurrent identical starts yield one lane.
+and launch, with a task record saved before admission. A lost launch
+receipt plus a failed roster read retains that record and its worktree.
+Retrying the same UUID reads the roster and adopts its original
+`launchTurnId`; it never replays the prompt. A roster absence alone
+cannot prove that a session/start was not accepted: `admissionUncertain`
+remains blocked pending reconciliation. No worktree is removed on an
+uncertain launch. Full UUID aliases avoid shared-prefix collisions and
+the daemon rejects duplicate names before creating a session.
+
+Cancellation checks the admitted turn against the current lane, carries
+`expectedTurnId` through the control API, and sends that exact `turnId`
+on MSP `turn/cancel`. The daemon serializes the check and call against
+new submissions. Before runtime acceptance, verify the installed Muse
+schema and behavior honor `turnId` on cancellation, including a queued
+turn advancing between readback and cancellation. Status/result remain
+the terminal proof. Read-only resume rechecks both serve flags; status
+reports `read-only-unverified` if current posture cannot be verified.
 
 Reconnects reconcile against daemon evidence, not client death: a new
 adapter process settles tasks with a terminal event for their admitted
@@ -115,7 +131,15 @@ trusted host is never substituted silently.
    not the harness contract; it does not vendor restricted upstream
    code (the Grok investigation informed protocol choices only).
 
-## Deployment (for Codex to review and execute)
+## Deployment (requires separate runtime authorization)
+
+The handoff reports the installed registration named `muse-remote` has
+already been repointed. That is reported state, not runtime validation
+by this source change. Inspect the actual registration before any later
+authorized operation. `m8s` in the commands below is an example name;
+it must not be treated as the installed registration or added alongside
+it by assumption. Preserve the prior executable/argv privately for
+rollback; never put credentials or tokens in this document.
 
 On the host that owns the daemons (today pve-t340), as the daemon user:
 
@@ -135,15 +159,17 @@ codex mcp add m8s -- ssh pve-t340 python3 /path/to/Mousagetes/scripts/m8s-mcp se
 
 Cutover check: `health` (enforced read-only verified) + one `read_only`
 start/status/result round-trip through `m8s-mcp`, with the Node bridge
-untouched. Only then remove the old registration
-(`codex mcp remove muse-remote` on Windows).
+untouched. For an authorized replacement, update the actual registration
+in place after the acceptance check. Do not remove `muse-remote` merely
+because this example calls the new adapter `m8s`.
 
 ## Rollback
 
 ```bash
-codex mcp remove m8s            # on the Codex machine
-# Re-add the Node bridge registration if it was removed:
-codex mcp add muse-remote -- <previous ssh invocation>
+# Example only: restore the saved prior argv under the actual name.
+# The handoff names that registration muse-remote; verify it first.
+codex mcp remove <actual-registration-name>
+codex mcp add <actual-registration-name> -- <saved-prior-executable-and-argv>
 ```
 
 Rollback stops only adapter processes. Daemon lanes (both hosts) keep

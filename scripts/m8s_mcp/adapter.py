@@ -420,6 +420,10 @@ class Adapter:
 
     def _enforcement(self, record: dict[str, Any]) -> str:
         if record.get("daemon", "rw") == "ro":
+            try:
+                self._verify_read_only()
+            except McpAdapterError:
+                return "read-only-unverified"
             return "enforced-read-only"
         if record.get("mode") == "read_only":
             # Pre-enforcement record: launched approval-gated on the
@@ -438,6 +442,10 @@ class Adapter:
         """
         for record in self._store.all():
             if record.get("status") not in ACTIVE_STATES:
+                continue
+            if not record.get("sessionId"):
+                # Admission has no receipt yet. Only an explicit retry may
+                # reconcile and then submit; restart never replays work.
                 continue
             try:
                 client_record: dict[str, Any] | None = record
@@ -766,7 +774,16 @@ class Adapter:
                         "duplicateRequestId",
                         "requestId was already used with different inputs",
                     )
-                return {"taskId": existing["taskId"], "duplicate": True}
+                if existing.get("sessionId"):
+                    return {"taskId": existing["taskId"], "duplicate": True}
+                # A prior launch may have been accepted after its reply was
+                # lost. Read the roster before any second launch attempt.
+                adopted = self._adopt_orphan(existing)
+                if adopted is not None:
+                    return self._record_launch(existing, adopted)
+                # An owned-roster absence does not prove that an in-flight
+                # session/start was never accepted. Never replay its prompt.
+                raise _error("admissionUncertain", "no admission receipt yet; retained task and workspace require reconciliation")
         else:
             request_uuid = str(uuid.uuid4())
 
@@ -783,86 +800,82 @@ class Adapter:
             _run_git(source, "worktree", "add", "--detach", worktree, commit)
             lane_workspace = worktree
 
-        # The alias derives from the requestId when one is supplied, so an
-        # uncertain retry (lost receipt, lane already created) finds and
-        # adopts its orphan instead of launching a second lane.
-        alias = f"mcp-{uuid.UUID(request_uuid).hex[:8]}"
+        # Use the complete UUID: a short prefix can alias another request.
+        alias = f"mcp-{uuid.UUID(request_uuid).hex}"
+        record = {
+            "taskId": task_id, "requestId": request_uuid,
+            "fingerprint": fingerprint, "daemon": daemon,
+            "sessionId": None, "alias": alias, "mode": mode,
+            "model": model, "ref": ref, "commit": commit,
+            "sourceWorkspace": str(source), "workspace": lane_workspace,
+            "worktree": worktree, "prompt": prompt, "turnId": None,
+            "status": "starting", "cancelRequested": False,
+            "createdAt": _now(), "updatedAt": _now(),
+        }
+        # Persist ownership before crossing the daemon boundary. A failed
+        # readback must never erase the only pointer to a possibly live lane.
+        store.save(record)
+        return self._launch_record(record)
+
+    def _launch_record(self, record: dict[str, Any]) -> dict[str, Any]:
+        alias = str(record["alias"])
+        owner = {"daemon": record["daemon"]}
         launch: dict[str, Any] = {
             "command": "launch",
             "name": alias,
-            "workspace": lane_workspace,
-            "prompt": prompt,
-            "approvalMode": APPROVAL_MODE[mode],
+            "workspace": record["workspace"],
+            "prompt": record["prompt"],
+            "approvalMode": APPROVAL_MODE[record["mode"]],
         }
-        if model:
-            launch["model"] = model
-        owner: dict[str, Any] | None = {"daemon": daemon}
+        if record.get("model"):
+            launch["model"] = record["model"]
         try:
             launched = self._daemon(launch, owner) or {}
-        except McpAdapterError:
-            adopted = self._adopt_orphan(owner, alias)
+        except McpAdapterError as exc:
+            try:
+                adopted = self._adopt_orphan(record)
+            except McpAdapterError:
+                adopted = None
             if adopted is None:
-                if worktree is not None:
-                    _remove_worktree(source, worktree)
-                raise
+                raise _error("admissionUncertain", "launch receipt unavailable; retry the same requestId after daemon readback") from exc
             launched = adopted
+        return self._record_launch(record, launched)
+
+    def _record_launch(self, record: dict[str, Any], launched: dict[str, Any]) -> dict[str, Any]:
         session = launched.get("session") or {}
         session_id = session.get("sessionId") or session.get("id")
         if not session_id:
-            if worktree is not None:
-                _remove_worktree(source, worktree)
-            raise _error("launchFailed", "daemon launch returned no session id")
+            raise _error("admissionUncertain", "launch returned no session id; retry the same requestId")
         turn = launched.get("turn") or {}
         turn_id = turn.get("turnId")
-        if not turn_id and isinstance(launched.get("session"), dict):
+        if not turn_id and not launched.get("adoptedOrphan") and isinstance(launched.get("session"), dict):
             turn_id = (session.get("activeTurn") or session.get("activeTurnId"))
-        record = {
-            "taskId": task_id,
-            "requestId": request_uuid,
-            "fingerprint": fingerprint,
-            "daemon": daemon,
-            "sessionId": str(session_id),
-            "alias": alias,
-            "mode": mode,
-            "model": model,
-            "ref": ref,
-            "commit": commit,
-            "sourceWorkspace": str(source),
-            "workspace": lane_workspace,
-            "worktree": worktree,
-            "prompt": prompt,
-            "turnId": str(turn_id) if turn_id else None,
-            "status": "running",
-            "cancelRequested": False,
-            "createdAt": _now(),
-            "updatedAt": _now(),
-        }
-        store.save(record)
-        return {"taskId": task_id, "sessionId": str(session_id)}
+        record.update(sessionId=str(session_id), turnId=str(turn_id) if turn_id else None,
+                      status="running" if turn_id else "starting", updatedAt=_now())
+        self._store.save(record)
+        return {"taskId": record["taskId"], "sessionId": str(session_id)}
 
     def _adopt_orphan(
-        self, owner: dict[str, Any], alias: str
+        self, record: dict[str, Any]
     ) -> dict[str, Any] | None:
         """Bind the lane an uncertain launch left behind, if any.
 
         When a launch receipt is lost after the daemon created the lane,
         the lane sits under our deterministic alias. Adopt it (session
-        plus live turn) instead of launching a duplicate. Returns None
-        when no such lane exists or the daemon cannot even be listed, in
-        which case the original error propagates.
+        plus live turn) instead of launching a duplicate. A failed roster
+        read propagates: it cannot prove the lane absent.
         """
-        try:
-            lanes = self._lanes(owner)
-        except McpAdapterError:
-            return None
+        lanes = self._lanes(record)
         for lane in lanes:
-            if lane.get("alias") == alias:
+            if lane.get("alias") == record["alias"]:
+                if lane.get("workspace") != record["workspace"]:
+                    raise _error("admissionUncertain", "matching alias has a different workspace")
                 session_id = lane.get("sessionId") or lane.get("id")
                 if not session_id:
                     continue
                 return {
                     "session": lane,
-                    "turn": {"turnId": lane.get("activeTurnId")},
+                    "turn": {"turnId": lane.get("launchTurnId")},
                     "adoptedOrphan": True,
                 }
         return None
@@ -874,6 +887,10 @@ class Adapter:
         return self._store.load(task_id)
 
     def _progress(self, record: dict[str, Any]) -> dict[str, Any]:
+        if not record.get("sessionId"):
+            return {"taskId": record["taskId"], "status": "starting", "mode": record.get("mode"),
+                    "sessionId": None, "turnId": None, "lanePresent": None,
+                    "note": "admission uncertain; retry start with the same requestId"}
         session_id = str(record["sessionId"])
         lane = self._lane(session_id, record)
         pending: dict[str, Any] = {}
@@ -918,6 +935,9 @@ class Adapter:
         inventing success.
         """
         record = self._owned(task_id)
+        if not record.get("sessionId"):
+            return {"taskId": task_id, "status": "starting", "terminal": None,
+                    "note": "admission uncertain; retry start with the same requestId"}
         if record.get("status") == "interrupted":
             return {
                 "taskId": task_id,
@@ -950,16 +970,18 @@ class Adapter:
         """Explicit follow-up in the adapter-owned idle lane. Never automatic."""
         record = self._owned(task_id)
         prompt = _require_str({"prompt": prompt}, "prompt")
+        if record.get("mode") == "read_only":
+            if record.get("daemon") != "ro":
+                raise _error("unsupportedReadOnly", "legacy task is not on an enforced read-only host; start a new task")
+            self._verify_read_only()
+        if not record.get("turnId"):
+            raise _error("turnUnknown", "task has no admitted turn receipt; reconcile before follow-up")
         session_id = str(record["sessionId"])
-        if self._lane(session_id, record) is None:
+        lane = self._lane(session_id, record)
+        if lane is None:
             raise _error("laneGone", "lane is no longer supervised by the daemon")
-        if (
-            self._terminal_for(session_id, record.get("turnId"), record) is None
-            and record.get("status") in ACTIVE_STATES
-        ):
-            lane = self._lane(session_id, record) or {}
-            if lane.get("activeTurnId"):
-                raise _error("turnBusy", "lane still has an active turn; wait or cancel first")
+        if lane.get("activeTurnId"):
+            raise _error("turnBusy", "lane still has an active turn; wait for it to finish")
         sent = self._daemon({"command": "send", "session": session_id, "prompt": prompt}, record) or {}
         turn_id = sent.get("turnId")
         if turn_id:
@@ -995,9 +1017,10 @@ class Adapter:
             if not isinstance(value, str) or not value:
                 raise _error("badArgument", f"{field} must be a non-empty string")
         pending = self._pending(session_id, record)
-        approvals = pending.get("approvals", []) if isinstance(pending, dict) else []
+        approvals = (pending.get("approvals") or pending.get("pendingApprovals") or pending.get("pending") or []) if isinstance(pending, dict) else []
         offered = next(
-            (item for item in approvals if isinstance(item, dict) and item.get("approvalId") == approval_id),
+            (item for item in approvals if isinstance(item, dict)
+             and item.get("approvalId", item.get("requestId", item.get("id"))) == approval_id),
             None,
         )
         if offered is None:
@@ -1006,9 +1029,10 @@ class Adapter:
         if current != requirement_id:
             raise _error("requirementChanged", "approval requirement changed; read status again")
         choices = offered.get("availableChoices", [])
-        if not any(
-            isinstance(choice, dict) and choice.get("choiceId") == choice_id for choice in choices
-        ):
+        if not isinstance(choices, list) or not any(
+            (choice == choice_id if isinstance(choice, str) else
+             isinstance(choice, dict) and choice.get("choiceId", choice.get("id")) == choice_id)
+            for choice in choices):
             raise _error("invalidChoice", "choice was not offered; read status again")
         decided = self._call(
             "approval/decide",
@@ -1028,9 +1052,17 @@ class Adapter:
         """
         record = self._owned(task_id)
         session_id = str(record["sessionId"])
-        if self._lane(session_id, record) is None:
+        turn_id = record.get("turnId")
+        if not turn_id:
+            raise _error("turnUnknown", "task has no admitted turn id")
+        lane = self._lane(session_id, record)
+        if lane is None:
             raise _error("laneGone", "lane is no longer supervised by the daemon")
-        self._call("turn/cancel", session_id, None, record)
+        if str(lane.get("activeTurnId") or "") != str(turn_id):
+            raise _error("turnChanged", "admitted turn is no longer active; refusing cancellation")
+        # The daemon checks this again immediately before the MSP call and
+        # serializes it against submissions to close the roster/cancel race.
+        self._call("turn/cancel", session_id, {"expectedTurnId": str(turn_id)}, record)
         record["cancelRequested"] = True
         record["updatedAt"] = _now()
         self._store.save(record)
@@ -1135,10 +1167,3 @@ def _fingerprint(source: str, prompt: str, mode: str, model: str | None, commit:
         {"source": source, "prompt": prompt, "mode": mode, "model": model, "commit": commit},
         sort_keys=True,
     )
-
-
-def _remove_worktree(source: Path, worktree: str) -> None:
-    try:
-        _run_git(source, "worktree", "remove", "--force", worktree)
-    except McpAdapterError:
-        pass

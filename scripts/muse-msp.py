@@ -2129,6 +2129,8 @@ class MspHost:
         self.next_id = 1
         self.sessions: dict[str, dict[str, Any]] = {}
         self.aliases: dict[str, str] = {}
+        self._turn_locks: dict[str, asyncio.Lock] = {}
+        self._launch_lock = asyncio.Lock()
         self.watchers: set[asyncio.StreamWriter] = set()
         self.stopping = asyncio.Event()
         self.budgets: dict[str, dict[str, Any]] = load_budgets()
@@ -2416,10 +2418,21 @@ class MspHost:
         return self.aliases.get(reference, reference)
 
     async def launch(self, args: dict[str, Any]) -> dict[str, Any]:
+        if not hasattr(self, "_launch_lock"):
+            self._launch_lock = asyncio.Lock()
+        async with self._launch_lock:
+            return await self._launch_locked(args)
+
+    async def _launch_locked(self, args: dict[str, Any]) -> dict[str, Any]:
         workspace = str(Path(args["workspace"]).resolve())
         if not Path(workspace).is_dir():
             raise ValueError(f"workspace does not exist: {workspace}")
         alias = args["name"]
+        if not isinstance(alias, str) or not alias:
+            raise CallValidationError("invalidAlias", "launch requires a non-empty name")
+        listed = await self.call("session/list", {"limit": 200})
+        if alias in self.aliases or any(item.get("name") == alias for item in listed.get("sessions", [])):
+            raise CallValidationError("aliasInUse", f"lane alias already exists: {alias!r}")
         started = await self.call(
             "session/start",
             {
@@ -2447,6 +2460,8 @@ class MspHost:
             {"commandId": uuid7(), "sessionId": session_id, "name": alias},
         )
         turn = await self.submit(session_id, args["prompt"], args.get("reasoningEffort"))
+        self.sessions[session_id]["launchTurnId"] = turn.get("turnId")
+        self.snapshot_roster()
         self.record({"kind": "session.launched", "sessionId": session_id, "name": alias, "workspace": workspace})
         return {"session": self.sessions[session_id], "turn": turn}
 
@@ -2469,6 +2484,10 @@ class MspHost:
 
     async def submit(self, reference: str, prompt: str, reasoning: str | None = None) -> dict[str, Any]:
         session_id = self.resolve(reference)
+        async with self._turn_lock(session_id):
+            return await self._submit_locked(session_id, reference, prompt, reasoning)
+
+    async def _submit_locked(self, session_id: str, reference: str, prompt: str, reasoning: str | None) -> dict[str, Any]:
         if session_id in self._retired_ids():
             raise RetireError("sessionRetired", f"session is retired, not supervised: {reference!r}")
         self.enforce_budget(session_id)
@@ -2491,6 +2510,12 @@ class MspHost:
             state["activeTurn"] = result.get("turnId") or params["commandId"]
         self.record({"kind": "turn.submitted", "sessionId": session_id, "turnId": result.get("turnId")})
         return result
+
+    def _turn_lock(self, session_id: str) -> asyncio.Lock:
+        # Older embedders may construct a host without invoking __init__.
+        if not hasattr(self, "_turn_locks"):
+            self._turn_locks = {}
+        return self._turn_locks.setdefault(session_id, asyncio.Lock())
 
     def owner_acted(self, session_id: str) -> None:
         """Record an owner action: clears stuck/attention flags for the lane."""
@@ -2758,7 +2783,7 @@ class MspHost:
                 continue
             state = self.sessions[session_id]
             merged = {**item, "alias": state.get("alias")}
-            for key in ("tokenUsage", "contextUsage", "modelId", "budget", "lastActivity"):
+            for key in ("tokenUsage", "contextUsage", "modelId", "budget", "lastActivity", "launchTurnId"):
                 merged.setdefault(key, state.get(key))
             merged["overBudget"] = bool(state.get("overBudget"))
             merged["needsOwnerAction"] = bool(state.get("needsOwnerAction"))
@@ -2919,6 +2944,15 @@ class MspHost:
         params: dict[str, Any] | None = None,
         command_id: str = "auto",
     ) -> Any:
+        session_id = (params or {}).get("sessionId")
+        if method in ("turn/start", "turn/cancel", "turn/unqueue") and isinstance(session_id, str) and session_id:
+            async with self._turn_lock(session_id):
+                return await self._supervised_call_locked(method, params, command_id)
+        return await self._supervised_call_locked(method, params, command_id)
+
+    async def _supervised_call_locked(
+        self, method: str, params: dict[str, Any] | None, command_id: str
+    ) -> Any:
         """Generic MSP passthrough covering every schema method.
 
         Resolves nothing by itself; the caller supplies sessionIds (use the
@@ -2934,6 +2968,20 @@ class MspHost:
         """
         validate_call(method, params, command_id)
         merged = dict(params or {})
+        if "expectedTurnId" in merged:
+            expected_turn = merged.pop("expectedTurnId")
+            if method != "turn/cancel" or not isinstance(expected_turn, str) or not expected_turn:
+                raise CallValidationError("invalidTurnFence", "expectedTurnId is only valid for turn/cancel")
+            if not isinstance(merged.get("sessionId"), str) or not merged["sessionId"]:
+                raise CallValidationError("invalidTurnFence", "turn fence requires sessionId")
+            current = await self.call("session/read", {"sessionId": merged["sessionId"]})
+            current_session = current.get("session") if isinstance(current, dict) else None
+            active = current_session.get("activeTurnId") if isinstance(current_session, dict) else None
+            if str(active or "") != expected_turn:
+                raise CallValidationError("turnChanged", "admitted turn is no longer active; refusing cancellation")
+            # Carry the fence onto MSP as well: queued turns can advance
+            # within the Muse host independently of this daemon's locks.
+            merged["turnId"] = expected_turn
         if command_id != "off" and method in COMMAND_METHODS and "commandId" not in merged:
             merged["commandId"] = uuid7() if command_id in (None, "auto") else command_id
         session_id = merged.get("sessionId")

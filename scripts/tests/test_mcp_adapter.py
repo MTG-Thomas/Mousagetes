@@ -61,6 +61,9 @@ class FakeDaemon:
         #: When True, the next launch creates its lane and then answers
         #: ok:false -- an uncertain receipt (lane exists, caller unsure).
         self.fail_next_launch_after_create = False
+        self.fail_roster = False
+        self.fail_launch_before_create = False
+        self.replace_turn_on_cancel = False
         self._lock = threading.Lock()
         self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._socket.bind(str(path))
@@ -114,10 +117,14 @@ class FakeDaemon:
                 lanes = list(self.lanes.values())
             return {"sessions": lanes, "serveArgv": list(self.serve_argv)}
         if command == "list":
+            if self.fail_roster:
+                raise RuntimeError("roster unavailable")
             with self._lock:
                 lanes = list(self.lanes.values())
             return {"sessions": lanes}
         if command == "launch":
+            if self.fail_launch_before_create:
+                raise RuntimeError("launch unavailable")
             session_id = str(uuid.uuid4())
             turn_id = f"turn-{session_id[:8]}"
             lane = {
@@ -127,6 +134,7 @@ class FakeDaemon:
                 "status": "running",
                 "approvalMode": request.get("approvalMode"),
                 "activeTurnId": turn_id,
+                "launchTurnId": turn_id,
             }
             with self._lock:
                 lane["lastTurn"] = {"turnId": turn_id, "terminal": None}
@@ -191,7 +199,11 @@ class FakeDaemon:
         if method == "turn/cancel":
             with self._lock:
                 lane = self.lanes.get(session)
+                if self.replace_turn_on_cancel and lane is not None:
+                    lane["activeTurnId"] = "foreign-turn"
                 turn_id = (lane or {}).get("activeTurnId")
+                if params.get("expectedTurnId") != turn_id:
+                    raise RuntimeError("turnChanged")
                 if lane is not None:
                     lane.pop("activeTurnId", None)
                     lane["lastTurn"] = {"turnId": turn_id, "terminal": "cancelled"}
@@ -564,6 +576,27 @@ class ApprovalTests(AdapterCase):
             )
         self.assertEqual(self.daemon.methods("approval/decide"), [])
 
+    def test_supported_approval_choice_formats_keep_exact_requirement(self) -> None:
+        task_id, session_id, _ = self._task_with_approval(make_repo())
+        for field, identity, choices in (
+            ("approvals", "approvalId", ["allow"]),
+            ("pendingApprovals", "requestId", [{"id": "allow"}]),
+            ("pending", "id", [{"choiceId": "allow"}]),
+        ):
+            with self.subTest(field=field):
+                self.daemon.pending_map[session_id] = {field: [{identity: "ap-1",
+                    "currentRequirementId": 0, "availableChoices": choices}]}
+                self.adapter.approve(task_id, "ap-1", 0, "allow")
+        self.assertEqual(len(self.daemon.decides), 3)
+        self.assertTrue(all(d["requirementId"] == 0 for d in self.daemon.decides))
+
+    def test_explicit_malformed_choices_reject(self) -> None:
+        task_id, session_id, requirement = self._task_with_approval(make_repo())
+        self.daemon.pending_map[session_id]["approvals"][0]["availableChoices"] = {"allow": True}
+        with self.assertRaisesRegex(McpAdapterError, "invalidChoice"):
+            self.adapter.approve(task_id, "ap-1", requirement, "allow")
+        self.assertEqual(self.daemon.decides, [])
+
 
 class ReadOnlyTests(AdapterCase):
     def test_roster_merges_both_hosts_and_read_falls_back(self) -> None:
@@ -743,13 +776,93 @@ class AtomicStartTests(AdapterCase):
         self.assertEqual(len(self.daemon.lanes), 1)
         (session_id,) = list(self.daemon.lanes)
         self.assertEqual(out["sessionId"], session_id)
-        # Retry with the same requestId replays instead of launching again.
         again = self.adapter.dispatch(
             "start", {"workspace": str(repo), "prompt": "unsure", "requestId": request_id}
         )
         self.assertEqual(again["taskId"], out["taskId"])
         self.assertEqual(len(self.daemon.launches()), 1)
-        self.assertEqual(len(self.daemon.lanes), 1)
+
+    def test_uncertain_launch_and_roster_failure_preserves_worktree(self) -> None:
+        repo = make_repo()
+        request_id = str(uuid.uuid4())
+        self.rw_daemon.fail_next_launch_after_create = True
+        self.rw_daemon.fail_roster = True
+        args = {"workspace": str(repo), "prompt": "unsure", "mode": "worktree", "requestId": request_id}
+        with self.assertRaises(McpAdapterError) as ctx:
+            self.adapter.dispatch("start", args)
+        self.assertEqual(ctx.exception.kind, "admissionUncertain")
+        record = self.adapter._store.find_by_request(request_id)
+        self.assertEqual(record["status"], "starting")
+        worktree = Path(record["workspace"])
+        self.assertTrue(worktree.is_dir())
+        (worktree / "valuable.txt").write_text("do not destroy")
+        restarted = Adapter(client=ControlClient(self.rw_daemon.path), state_dir=self.state)
+        with self.assertRaises(McpAdapterError):
+            restarted.dispatch("start", args)
+        self.assertEqual(len(self.rw_daemon.launches()), 1)
+        self.rw_daemon.fail_roster = False
+        # A later foreign turn must not replace the launch receipt.
+        lane = next(iter(self.rw_daemon.lanes.values()))
+        admitted = lane["launchTurnId"]
+        lane["activeTurnId"] = "foreign-turn"
+        out = restarted.dispatch("start", args)
+        self.assertEqual(out["taskId"], record["taskId"])
+        self.assertEqual(restarted._owned(out["taskId"])["turnId"], admitted)
+        self.assertEqual((worktree / "valuable.txt").read_text(), "do not destroy")
+        self.assertEqual(len(self.rw_daemon.launches()), 1)
+
+    def test_absent_roster_does_not_replay_uncertain_prompt(self) -> None:
+        repo = make_repo()
+        request_id = str(uuid.uuid4())
+        self.daemon.fail_launch_before_create = True
+        args = {"workspace": str(repo), "prompt": "unsure", "requestId": request_id}
+        with self.assertRaises(McpAdapterError):
+            self.adapter.dispatch("start", args)
+        self.daemon.fail_launch_before_create = False
+        with self.assertRaises(McpAdapterError) as ctx:
+            self.adapter.dispatch("start", args)
+        self.assertEqual(ctx.exception.kind, "admissionUncertain")
+        self.assertEqual(len(self.daemon.launches()), 1)
+
+    def test_cancel_rejects_foreign_turn_and_roster_race(self) -> None:
+        out = self.start_task(make_repo())
+        lane = self.daemon.lanes[out["sessionId"]]
+        admitted = lane["activeTurnId"]
+        lane["activeTurnId"] = "foreign-turn"
+        with self.assertRaises(McpAdapterError) as ctx:
+            self.adapter.cancel(out["taskId"])
+        self.assertEqual(ctx.exception.kind, "turnChanged")
+        self.assertEqual(self.daemon.methods("turn/cancel"), [])
+        lane["activeTurnId"] = admitted
+        self.daemon.replace_turn_on_cancel = True
+        with self.assertRaises(McpAdapterError):
+            self.adapter.cancel(out["taskId"])
+        self.assertEqual(lane["activeTurnId"], "foreign-turn")
+        self.assertFalse(self.adapter._owned(out["taskId"])["cancelRequested"])
+
+    def test_read_only_posture_is_reverified_for_status_and_resume(self) -> None:
+        out = self.start_task(make_repo())
+        self.terminal(out["sessionId"], self.adapter._owned(out["taskId"])["turnId"], "completed")
+        self.daemon.serve_argv = list(RW_ARGV)
+        self.assertEqual(self.adapter.status(out["taskId"])["enforcement"], "read-only-unverified")
+        with self.assertRaises(McpAdapterError) as ctx:
+            self.adapter.resume(out["taskId"], "continue")
+        self.assertEqual(ctx.exception.kind, "readOnlyMisconfigured")
+        self.assertFalse(any(r.get("command") == "send" for r in self.daemon.requests))
+
+    def test_completed_task_cannot_resume_into_foreign_active_turn(self) -> None:
+        out = self.start_task(make_repo())
+        self.terminal(out["sessionId"], self.adapter._owned(out["taskId"])["turnId"], "completed")
+        self.daemon.lanes[out["sessionId"]]["activeTurnId"] = "foreign-turn"
+        with self.assertRaisesRegex(McpAdapterError, "turnBusy"):
+            self.adapter.resume(out["taskId"], "continue")
+        self.assertFalse(any(r.get("command") == "send" for r in self.daemon.requests))
+
+    def test_full_request_uuid_keeps_shared_prefix_aliases_unique(self) -> None:
+        repo = make_repo()
+        for suffix in ("000000000001", "000000000002"):
+            self.start_task(repo, requestId=f"aaaaaaaa-0000-0000-0000-{suffix}")
+        self.assertEqual(len({r["name"] for r in self.daemon.launches()}), 2)
 
 
 class LiveShapeTests(AdapterCase):
@@ -824,4 +937,3 @@ class LiveShapeTests(AdapterCase):
 
 if __name__ == "__main__":
     unittest.main()
-
