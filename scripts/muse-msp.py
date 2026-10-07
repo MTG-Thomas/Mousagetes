@@ -2376,6 +2376,18 @@ class MspHost:
                             "summary": f"turn {terminal} with no owner action yet",
                         }
                     )
+            elif method == "approval/resolved":
+                # Issue #35: the decide ack is not the outcome. Project the
+                # durable decision/policyResult/resolvedBy (+ session
+                # amendment durability) into lane state. First terminal
+                # wins; later duplicates keep the original identity.
+                # Read-only: approval semantics and pending requirement
+                # identities are untouched here.
+                summary = approval_resolution_summary(params)
+                if summary is not None:
+                    resolutions = state.setdefault("approvalResolutions", {})
+                    resolutions.setdefault(summary["approvalId"], summary)
+                    state["lastApprovalResolution"] = resolutions[summary["approvalId"]]
         interesting = {
             "session/statusChanged",
             "session/tokenUsage",
@@ -2794,6 +2806,12 @@ class MspHost:
                 sid = event_session(record)
                 if sid is not None:
                     blockers.setdefault(sid, []).append(record)
+        # Issue #35: a resolved approval's blocker record stays in history
+        # but stops counting as pending.
+        for sid, records in list(blockers.items()):
+            blockers[sid] = unresolved_blockers(
+                records, resolved_approval_ids(self.sessions.get(sid))
+            )
         inputs: list[dict[str, Any]] = []
         pending_by: dict[str, dict[str, int]] = {}
         progress_by: dict[str, dict[str, Any]] = {}
@@ -3079,6 +3097,75 @@ def pending_counts(
         elif reason.startswith("userInput"):
             inputs += 1
     return {"approvals": approvals, "inputs": inputs}
+
+
+def approval_resolution_summary(params: Any) -> dict[str, Any] | None:
+    """Summarize an `approval/resolved` notification (issue #35, read-only).
+
+    Returns the outcome identity (approvalId, decision, policyResult,
+    resolvedBy, plus amendment durability / decidedAt when present), or
+    None when there is no usable approvalId. Never raises — malformed
+    frames are logged by the caller, never projected.
+    """
+    if not isinstance(params, dict):
+        return None
+    approval_id = params.get("approvalId")
+    if not isinstance(approval_id, str) or not approval_id:
+        return None
+    summary: dict[str, Any] = {"approvalId": approval_id}
+    for key in ("decision", "policyResult", "resolvedBy", "decidedAt",
+                "decidedByCommandId", "itemId", "turnId"):
+        value = params.get(key)
+        if isinstance(value, str) and value:
+            summary[key] = value
+    amendment = params.get("amendment")
+    if isinstance(amendment, dict):
+        durability = amendment.get("durability")
+        if isinstance(durability, str) and durability:
+            summary["amendmentDurability"] = durability
+        preview = amendment.get("rulePreview")
+        if isinstance(preview, str) and preview:
+            summary["amendmentRulePreview"] = preview
+    return summary
+
+
+def resolved_approval_ids(state: Any) -> set[str]:
+    """Approval ids with a projected `approval/resolved` outcome."""
+    if not isinstance(state, dict):
+        return set()
+    resolutions = state.get("approvalResolutions")
+    if not isinstance(resolutions, dict):
+        return set()
+    return {str(key) for key in resolutions}
+
+
+def unresolved_blockers(
+    records: list[dict[str, Any]] | None,
+    resolved_ids: set[str] | None,
+) -> list[dict[str, Any]]:
+    """Drop blocker records whose approval already resolved (issue #35).
+
+    The event log is append-only, so a resolved approval's `blocker`
+    record stays in history; it just stops counting as pending. Records
+    without a requestId, non-approval records, and unknown ids pass
+    through untouched. Never raises.
+    """
+    if not records:
+        return []
+    resolved = resolved_ids or set()
+    if not resolved:
+        return list(records)
+    live: list[dict[str, Any]] = []
+    for record in records:
+        try:
+            if (isinstance(record, dict)
+                    and str(record.get("reason") or "").startswith("approval")
+                    and str(record.get("requestId") or "") in resolved):
+                continue
+        except (TypeError, ValueError, AttributeError):
+            pass
+        live.append(record)
+    return live
 
 
 def pr_check_state(rollup: Any) -> str | None:
@@ -3443,7 +3530,19 @@ async def dispatch(host: MspHost, request: dict[str, Any]) -> Any:
     if command == "events":
         return {"events": read_events(float(request.get("after", 0)), int(request.get("limit", 200)))}
     if command == "pending":
-        result = await host.call("approval/listPending", {"sessionId": host.resolve(request["session"])})
+        session_id = host.resolve(request["session"])
+        result = await host.call("approval/listPending", {"sessionId": session_id})
+        # Issue #35: surface projected approval outcomes alongside the live
+        # pending listing (additive; the server listing stays authoritative
+        # for what is still pending).
+        if isinstance(result, dict):
+            resolutions = (host.sessions.get(session_id) or {}).get("approvalResolutions")
+            if isinstance(resolutions, dict) and resolutions:
+                merged = dict(result)
+                merged["resolvedApprovals"] = [
+                    resolutions[key] for key in sorted(resolutions)
+                ]
+                return merged
         return result
     if command == "inbox":
         # One aggregate read across owned sessions: per-lane pending
