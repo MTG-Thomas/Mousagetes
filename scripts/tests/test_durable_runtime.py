@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -143,15 +144,28 @@ class DurableRuntimeTest(unittest.TestCase):
         mod.init_runtime()
         self.assertFalse(mod.daemon_running())
         proc_root = self.tmp / "proc"
-        # PID 1 is alive in this container; give it a serve cmdline.
-        victim = proc_root / "1"
+        # Hermetic predecessor: a real same-uid child, so the kill(0)
+        # aliveness check passes for any runner user. PID 1 is NOT
+        # usable: unprivileged CI users get EPERM signalling it, and the
+        # (correct) aliveness filter then drops it.
+        alive = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(lambda: (alive.terminate(), alive.wait()))
+        victim = proc_root / str(alive.pid)
         victim.mkdir(parents=True)
         (victim / "cmdline").write_bytes(b"python3\x00muse-msp.py\x00serve\x00")
+        # A reaped child keeps a serve cmdline but fails kill(0): dead
+        # PIDs must never block startup.
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        gone = proc_root / str(dead.pid)
+        gone.mkdir(parents=True)
+        (gone / "cmdline").write_bytes(b"python3\x00muse-msp.py\x00serve\x00")
         other = proc_root / "2"
         other.mkdir(parents=True)
         (other / "cmdline").write_bytes(b"python3\x00something-else\x00")
         pids = mod.live_serve_pids(proc_root)
-        self.assertIn(1, pids)
+        self.assertIn(alive.pid, pids)
+        self.assertNotIn(dead.pid, pids)
         self.assertNotIn(2, pids)
         self.assertEqual(mod.predecessor_pids.__name__, "predecessor_pids")
 
@@ -167,7 +181,7 @@ class DurableRuntimeTest(unittest.TestCase):
         finally:
             mod.subprocess.Popen = real_popen  # type: ignore[method-assign]
         self.assertIn("predecessor", str(ctx.exception))
-        self.assertIn("1", str(ctx.exception))
+        self.assertIn(str(alive.pid), str(ctx.exception))
 
     def test_orphan_force_starts_without_predecessor(self) -> None:
         mod = self._fresh(
