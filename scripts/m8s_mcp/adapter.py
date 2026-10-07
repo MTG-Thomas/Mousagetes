@@ -94,6 +94,8 @@ MAX_ACTIVE_TASKS = 4
 PREVIEW_CHARS = 4000
 DIFF_CHARS = 20000
 EVENTS_SCAN = 500
+VIEW_LIMIT = 50
+VIEW_PAGES = 10
 
 ACTIVE_STATES = frozenset({"starting", "running", "awaiting_approval"})
 
@@ -272,26 +274,53 @@ def _truncate(text: str, limit: int) -> tuple[str, bool]:
     return text[:limit], True
 
 
-def _read_text(read: Any) -> str:
-    """Best-effort assistant text from a session/read payload (preview only)."""
-    parts: list[str] = []
-    if isinstance(read, dict):
-        messages = read.get("messages") or read.get("transcript") or []
-        if isinstance(messages, list):
-            for message in messages[-20:]:
-                if not isinstance(message, dict):
-                    continue
-                role = message.get("role") or ""
-                content = message.get("content") or message.get("text") or ""
-                if isinstance(content, list):
-                    content = " ".join(
-                        block.get("text", "") for block in content if isinstance(block, dict)
-                    )
-                if isinstance(content, str) and content:
-                    parts.append(f"{role}: {content}"[:2000])
-        elif isinstance(read.get("text"), str):
-            parts.append(read["text"])
-    return "\n\n".join(parts)
+def _frame_items(events: Any) -> list[dict[str, Any]]:
+    """Plain item dicts from live view/page notification frames.
+
+    The daemon emits ``{"method": ..., "params": {"item": {...}}}`` frames;
+    callers want the ``item`` dicts, not the frames.
+    """
+    items: list[dict[str, Any]] = []
+    if not isinstance(events, list):
+        return items
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        item = event.get("params", {}).get("item") if isinstance(event.get("params"), dict) else None
+        if isinstance(item, dict):
+            items.append(item)
+    return items
+
+
+def _turn_answer(events: Any, turn_id: str | None) -> str:
+    """Assistant answer text bound to one turn id from view frames.
+
+    Joins ``agentMessage`` item text whose ``item.turnId`` equals the
+    admitted turn (highest revision per item wins). Anything from another
+    turn — earlier briefs, foreign turns — is never mixed in.
+    """
+    if not turn_id:
+        return ""
+    latest: dict[str, tuple[int, str]] = {}
+    order: list[str] = []
+    for item in _frame_items(events):
+        if item.get("kind") != "agentMessage":
+            continue
+        if str(item.get("turnId") or "") != str(turn_id):
+            continue
+        text = item.get("text")
+        if not isinstance(text, str) or not text:
+            continue
+        try:
+            revision = int(item.get("revision", 0))
+        except (TypeError, ValueError):
+            revision = 0
+        item_id = str(item.get("itemId") or len(order))
+        if item_id not in latest:
+            order.append(item_id)
+        if revision >= latest.get(item_id, (-1, ""))[0]:
+            latest[item_id] = (revision, text)
+    return "\n\n".join(latest[item_id][1] for item_id in order if item_id in latest)
 
 
 class Adapter:
@@ -476,15 +505,65 @@ class Adapter:
             return params
         return None
 
-    def _transcript_tail(
+    def _view_all(
         self, session_id: str, record: dict[str, Any] | None = None
-    ) -> tuple[str, bool]:
+    ) -> list[dict[str, Any]]:
+        """All view/page frames for a lane (follows nextCursor, bounded)."""
+        frames: list[dict[str, Any]] = []
+        cursor: str | None = None
+        for _ in range(VIEW_PAGES):
+            params: dict[str, Any] = {"limit": VIEW_LIMIT}
+            if cursor:
+                params["cursor"] = cursor
+            page = self._call("view/page", session_id, params, record) or {}
+            if not isinstance(page, dict):
+                break
+            events = page.get("events") or []
+            frames.extend(event for event in events if isinstance(event, dict))
+            cursor = page.get("nextCursor")
+            if not cursor or not isinstance(cursor, str):
+                break
+        return frames
+
+    def _resolve_turn(
+        self, session_id: str, record: dict[str, Any] | None
+    ) -> str | None:
+        """Admitted turn id, falling back to session/read's lastTurn."""
+        if record is not None and record.get("turnId"):
+            return str(record["turnId"])
         try:
             read = self._call("session/read", session_id, None, record) or {}
         except McpAdapterError:
+            return None
+        last_turn = read.get("lastTurn") if isinstance(read, dict) else None
+        if isinstance(last_turn, dict) and last_turn.get("turnId"):
+            return str(last_turn["turnId"])
+        return None
+
+    def _transcript_tail(
+        self, session_id: str, record: dict[str, Any] | None = None
+    ) -> tuple[str, bool]:
+        """Preview/evidence: agent answer bound to the admitted turn.
+
+        ``session/read`` excludes history by default
+        (``history.mode: none``), so text comes from the materialized
+        view's ``agentMessage`` items for exactly this turn.
+        """
+        try:
+            turn_id = self._resolve_turn(session_id, record)
+            if turn_id is None:
+                return "", False
+            frames = self._view_all(session_id, record)
+        except McpAdapterError:
             return "", False
-        text = _read_text(read)
-        return _truncate(text, PREVIEW_CHARS)
+        return _truncate(_turn_answer(frames, turn_id), PREVIEW_CHARS)
+
+    def _owner_for_session(self, session_id: str) -> dict[str, Any] | None:
+        """Owning-daemon pointer for an adapter-owned session, if any."""
+        for record in self._store.all():
+            if str(record.get("sessionId") or "") == session_id:
+                return {"daemon": record.get("daemon", "rw")}
+        return None
 
     # -- read tools --------------------------------------------------------
 
@@ -566,9 +645,26 @@ class Adapter:
         return out
 
     def session_read(self, session_id: str, include_items: bool = False) -> dict[str, Any]:
-        """Point-in-time snapshot from either host. Never resumes or takes a lease."""
+        """Point-in-time snapshot from the owning host. Never resumes or takes a lease.
+
+        An adapter-owned session goes straight to its recorded daemon;
+        foreign sessions try the trusted host first, then the read-only
+        host. Note the daemon excludes history in ``session/read``
+        (``history.mode: none``); item content comes from the view.
+        """
         if not isinstance(session_id, str) or not session_id:
             raise _error("badArgument", "sessionId must be a non-empty string")
+        owned = self._owner_for_session(session_id)
+        if owned is not None:
+            tag = str(owned.get("daemon", "rw"))
+            try:
+                return self._session_read_on(owned, session_id, include_items, tag)
+            except McpAdapterError as exc:
+                if tag != "ro" or self._ro_client is None:
+                    raise
+                # Owned ro session unreadable on its host: report that,
+                # never silently substitute the trusted host's answer.
+                raise _error("laneUnreadable", f"owned session unreadable: {exc}") from exc
         try:
             return self._session_read_on(None, session_id, include_items, "rw")
         except McpAdapterError as rw_exc:
@@ -585,8 +681,7 @@ class Adapter:
         read = self._call("session/read", session_id, None, owner) or {}
         out: dict[str, Any] = {"sessionId": session_id, "daemon": tag, "snapshot": read}
         if include_items:
-            page = self._call("view/page", session_id, {"limit": 50}, owner) or {}
-            out["items"] = page.get("events", [])
+            out["items"] = _frame_items(self._view_all(session_id, owner))
         return out
 
     def tasks(self) -> dict[str, Any]:

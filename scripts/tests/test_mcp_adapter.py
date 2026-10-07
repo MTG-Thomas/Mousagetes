@@ -56,6 +56,8 @@ class FakeDaemon:
         self.pending_map: dict[str, dict[str, Any]] = {}
         self.events: list[dict[str, Any]] = []
         self.decides: list[dict[str, Any]] = []
+        #: Live-shape view frames per session: {"method", "params": {"item"}}.
+        self.items: dict[str, list[dict[str, Any]]] = {}
         #: When True, the next launch creates its lane and then answers
         #: ok:false -- an uncertain receipt (lane exists, caller unsure).
         self.fail_next_launch_after_create = False
@@ -127,6 +129,7 @@ class FakeDaemon:
                 "activeTurnId": turn_id,
             }
             with self._lock:
+                lane["lastTurn"] = {"turnId": turn_id, "terminal": None}
                 self.lanes[session_id] = lane
                 uncertain = self.fail_next_launch_after_create
                 self.fail_next_launch_after_create = False
@@ -139,6 +142,7 @@ class FakeDaemon:
                 lane = self.lanes.get(request.get("session"))
                 if lane is not None:
                     lane["activeTurnId"] = turn_id
+                    lane["lastTurn"] = {"turnId": turn_id, "terminal": None}
             return {"turnId": turn_id}
         if command == "pending":
             with self._lock:
@@ -157,12 +161,24 @@ class FakeDaemon:
         if method == "model/list":
             return {"models": [{"modelId": "muse-test-1", "name": "test"}]}
         if method == "session/read":
+            # Live shape: history excluded, lastTurn authoritative.
             with self._lock:
-                if session not in self.lanes:
+                lane = self.lanes.get(session)
+                if lane is None:
                     raise RuntimeError(f"unknown session: {session!r}")
-            return {"messages": [{"role": "assistant", "content": "hello from lane"}]}
+                last_turn = lane.get("lastTurn")
+            return {
+                "history": {"items": None, "mode": "none", "noneReason": "excluded", "snapshot": None},
+                "lastTurn": last_turn,
+                "pendingRequests": [],
+                "session": {"sessionId": session, "status": lane.get("status", "running")},
+                "viewCursor": lane.get("viewCursor", "v:0"),
+            }
         if method == "view/page":
-            return {"events": [], "nextCursor": None}
+            # Live shape: notification frames carrying params.item.
+            with self._lock:
+                frames = list(self.items.get(session, []))
+            return {"events": frames, "nextCursor": None}
         if method == "approval/decide":
             with self._lock:
                 self.decides.append({"session": session, **params})
@@ -178,6 +194,7 @@ class FakeDaemon:
                 turn_id = (lane or {}).get("activeTurnId")
                 if lane is not None:
                     lane.pop("activeTurnId", None)
+                    lane["lastTurn"] = {"turnId": turn_id, "terminal": "cancelled"}
                 self.events.append(
                     {
                         "kind": "msp.event",
@@ -187,6 +204,33 @@ class FakeDaemon:
                 )
             return {"cancelled": True}
         raise AssertionError(f"unexpected call method: {method}")
+
+    def add_item(
+        self,
+        session: str,
+        kind: str,
+        text: str,
+        turn_id: str,
+        revision: int = 1,
+        item_id: str | None = None,
+    ) -> None:
+        """Append a live-shape item/completed frame to a lane's view."""
+        with self._lock:
+            self.items.setdefault(session, []).append(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "itemId": item_id or f"item-{len(self.items[session])}",
+                            "kind": kind,
+                            "text": text,
+                            "turnId": turn_id,
+                            "revision": revision,
+                            "status": "completed",
+                        }
+                    },
+                }
+            )
 
     def close(self) -> None:
         self._socket.close()
@@ -230,11 +274,19 @@ class AdapterCase(unittest.TestCase):
         args.update(kwargs)
         return self.adapter.dispatch("start", args)
 
+    def answer(self, session_id: str, text: str, turn_id: str) -> None:
+        """Seed the lane view with the admitted turn's agent answer."""
+        self.daemon.add_item(session_id, "agentMessage", text, turn_id)
+
     def terminal(self, session_id: str, turn_id: str, terminal: str) -> None:
         # Mirror the server: a completed turn clears the lane's active turn.
         lane = self.daemon.lanes.get(session_id)
         if lane is not None and lane.get("activeTurnId") == turn_id:
             lane.pop("activeTurnId", None)
+        with self.daemon._lock:
+            lane = self.daemon.lanes.get(session_id)
+            if lane is not None:
+                lane["lastTurn"] = {"turnId": turn_id, "terminal": terminal}
         self.daemon.events.append(
             {
                 "kind": "msp.event",
@@ -400,21 +452,26 @@ class LifecycleTests(AdapterCase):
         live = self.adapter.dispatch("result", {"taskId": task_id})
         self.assertIsNone(live["terminal"])
         # A failed terminal for the admitted turn settles as failed, never completed.
+        # Foreign-turn text in the view must not leak into our evidence.
+        self.answer(session_id, "someone else's answer", "turn-someone-else")
+        self.answer(session_id, "our admitted answer", turn_id)
         self.terminal(session_id, turn_id, "failed")
         failed = self.adapter.dispatch("result", {"taskId": task_id})
         self.assertEqual(failed["status"], "failed")
         self.assertEqual(failed["terminal"]["terminal"], "failed")
-        self.assertIn("hello from lane", failed["evidence"])
+        self.assertIn("our admitted answer", failed["evidence"])
+        self.assertNotIn("someone else's answer", failed["evidence"])
 
     def test_completed_terminal_carries_evidence(self) -> None:
         repo = make_repo()
         out = self.start_task(repo)
         record = self.state.joinpath("tasks", f"{out['taskId']}.json")
         turn_id = json.loads(record.read_text())["turnId"]
+        self.answer(out["sessionId"], "the completed answer", turn_id)
         self.terminal(out["sessionId"], turn_id, "completed")
         done = self.adapter.dispatch("result", {"taskId": out["taskId"]})
         self.assertEqual(done["status"], "completed")
-        self.assertIn("hello from lane", done["evidence"])
+        self.assertIn("the completed answer", done["evidence"])
 
     def test_cancel_uses_admitted_turn_and_confirms_via_result(self) -> None:
         repo = make_repo()
@@ -517,9 +574,15 @@ class ReadOnlyTests(AdapterCase):
         by_session = {entry["sessionId"]: entry["daemon"] for entry in roster if "sessionId" in entry}
         self.assertEqual(by_session.get(ro_task["sessionId"]), "ro")
         self.assertEqual(by_session.get(rw_task["sessionId"]), "rw")
+        ro_before = len([r for r in self.rw_daemon.requests if r.get("method") == "session/read"])
         ro_read = self.adapter.dispatch("session_read", {"sessionId": ro_task["sessionId"]})
         self.assertEqual(ro_read["daemon"], "ro")
-        self.assertIn("hello from lane", json.dumps(ro_read["snapshot"]))
+        # Owned ro sessions never touch the wrong host first.
+        self.assertEqual(
+            len([r for r in self.rw_daemon.requests if r.get("method") == "session/read"]),
+            ro_before,
+        )
+        self.assertEqual(ro_read["snapshot"]["session"]["sessionId"], ro_task["sessionId"])
         rw_read = self.adapter.dispatch("session_read", {"sessionId": rw_task["sessionId"]})
         self.assertEqual(rw_read["daemon"], "rw")
 
@@ -617,10 +680,11 @@ class ReconnectRecoveryTests(AdapterCase):
         live = second.dispatch("result", {"taskId": task_id})
         self.assertIsNone(live["terminal"])
         # The daemon finishes the admitted turn; the second process binds it.
+        self.answer(session_id, "recovered answer", turn_id)
         self.terminal(session_id, turn_id, "completed")
         done = second.dispatch("result", {"taskId": task_id})
         self.assertEqual(done["status"], "completed")
-        self.assertIn("hello from lane", done["evidence"])
+        self.assertIn("recovered answer", done["evidence"])
 
     def test_lane_gone_with_no_terminal_becomes_interrupted(self) -> None:
         repo = make_repo()
@@ -686,6 +750,76 @@ class AtomicStartTests(AdapterCase):
         self.assertEqual(again["taskId"], out["taskId"])
         self.assertEqual(len(self.daemon.launches()), 1)
         self.assertEqual(len(self.daemon.lanes), 1)
+
+
+class LiveShapeTests(AdapterCase):
+    """Regression for the staged smoke finding (task 3cfe1f0a…).
+
+    The daemon excludes history in ``session/read``
+    (``history.mode: none``) and carries transcript content as
+    ``view/page`` notification frames whose ``params.item`` holds the
+    turn binding. Evidence must come from those items for exactly the
+    admitted turn — never empty on a real completed turn, never foreign
+    text, never the wrong host's answer.
+    """
+
+    def seed_turn(self, session_id: str, turn_id: str) -> None:
+        # A prior brief turn plus the admitted turn, each with an answer,
+        # plus a stale revision of the admitted answer (highest rev wins).
+        self.answer(session_id, "brief answer", "turn-brief")
+        self.daemon.add_item(
+            session_id, "agentMessage", "stale draft", turn_id, revision=1, item_id="ans"
+        )
+        self.daemon.add_item(
+            session_id, "agentMessage", "# Mousagetes (m8s)\n", turn_id, revision=2, item_id="ans"
+        )
+        self.daemon.add_item(session_id, "toolCall", "read_file", turn_id)
+
+    def test_result_evidence_is_admitted_turn_answer(self) -> None:
+        repo = make_repo()
+        out = self.start_task(repo, prompt="Read README.md only")
+        record = self.state.joinpath("tasks", f"{out['taskId']}.json")
+        turn_id = json.loads(record.read_text())["turnId"]
+        self.seed_turn(out["sessionId"], turn_id)
+        status = self.adapter.dispatch("status", {"taskId": out["taskId"]})
+        self.assertIn("# Mousagetes (m8s)", status["preview"])
+        self.assertNotIn("brief answer", status["preview"])
+        self.assertNotIn("stale draft", status["preview"])
+        self.terminal(out["sessionId"], turn_id, "completed")
+        done = self.adapter.dispatch("result", {"taskId": out["taskId"]})
+        self.assertEqual(done["status"], "completed")
+        self.assertIn("# Mousagetes (m8s)", done["evidence"])
+        self.assertFalse(done["evidenceTruncated"])
+
+    def test_include_items_returns_plain_item_dicts(self) -> None:
+        repo = make_repo()
+        out = self.start_task(repo)
+        record = self.state.joinpath("tasks", f"{out['taskId']}.json")
+        turn_id = json.loads(record.read_text())["turnId"]
+        self.seed_turn(out["sessionId"], turn_id)
+        read = self.adapter.dispatch(
+            "session_read", {"sessionId": out["sessionId"], "includeItems": True}
+        )
+        self.assertEqual(read["daemon"], "ro")
+        kinds = [item.get("kind") for item in read["items"]]
+        self.assertIn("agentMessage", kinds)
+        for item in read["items"]:
+            self.assertNotIn("method", item)
+            self.assertIn("kind", item)
+            self.assertIn("turnId", item)
+
+    def test_last_turn_fallback_binds_preview_without_record_turn(self) -> None:
+        # A record that lost its turn pointer still previews via lastTurn.
+        repo = make_repo()
+        out = self.start_task(repo)
+        record_path = self.state.joinpath("tasks", f"{out['taskId']}.json")
+        record = json.loads(record_path.read_text())
+        turn_id = record["turnId"]
+        self.answer(out["sessionId"], "fallback answer", turn_id)
+        record["turnId"] = None
+        record_path.write_text(json.dumps(record))
+        status = self.adapter.dispatch("status", {"taskId": out["taskId"]})
+        self.assertIn("fallback answer", status["preview"])
 
 
 if __name__ == "__main__":

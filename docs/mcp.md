@@ -100,9 +100,13 @@ trusted host is never substituted silently.
    to CLI sandbox flags on bridge-owned sessions; here enforcement is
    per-host serve argv on a dedicated daemon, verified per use. Until
    that socket is supplied, `read_only` refuses rather than downgrades.
-2. **Turn evidence, not SDK items.** Progress previews come from
-   daemon `session/read` / `view/page` tails, bounded to 4,000 chars;
-   full logs stay on the host like before.
+2. **Turn evidence, not SDK items.** `session/read` excludes history
+   (`history.mode: none`), so previews and `result` evidence come from
+   the `view/page` materialized view: `agentMessage` item text whose
+   `item.turnId` equals the admitted turn (highest revision wins),
+   bounded to 4,000 chars. `session_read(includeItems=True)` returns
+   those plain item dicts, not notification frames. Full logs stay on
+   the host like before.
 3. **Bounded concurrency, evidence reconcile.** The 4-active-task cap
    is preserved and now lock-guarded; restart reconciles against daemon
    terminal/live evidence instead of blanket interruption. Per-lane
