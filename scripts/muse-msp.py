@@ -2361,6 +2361,16 @@ class MspHost:
                 if params.get("modelId"):
                     state["modelId"] = params["modelId"]
                 self.refresh_budget_flag(state)
+            elif method == "turn/unqueued":
+                # Queued reclaim won (issue #33): the queued submit never
+                # runs, so no turn/started or turn/completed follows. Record
+                # the terminal reclaim and drop the live-turn marker only
+                # when it names the reclaimed turn — a newer activeTurn for
+                # another turn must survive.
+                state["lastTerminal"] = "unqueued"
+                claimed = {params.get("turnId"), params.get("commandId")} - {None}
+                if claimed and state.get("activeTurn") in claimed:
+                    state.pop("activeTurn", None)
             elif method == "turn/completed":
                 terminal = params.get("terminal")
                 state["lastTerminal"] = terminal
@@ -2382,6 +2392,7 @@ class MspHost:
             "session/contextUsage",
             "session/modelChanged",
             "turn/completed",
+            "turn/unqueued",
             "turn/retryScheduled",
             "view/gap",
             "session/viewHealthChanged",
