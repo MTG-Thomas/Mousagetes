@@ -15,3 +15,12 @@ The daemon alone owns `muse serve`; adapters use its control API and never attac
 Use Python 3.10+; the runtime is standard-library-only. CI uses Python 3.12/3.13 and runs `python3 -m unittest discover -s scripts/tests -v`, `python3 scripts/bump-version.py --check`, and `ruff check scripts/ --select F,E9` after installing Ruff. Embedded web JavaScript also has a Node syntax gate in `.github/workflows/ci.yml`; changes to that UI must retain it.
 
 Consult [docs/release.md](docs/release.md) and release workflows before version/tag changes. Local tests do not authorize launch, messaging, steering, stopping sessions, or answering approvals on a live host; use only the user-authorized lane and verify its resulting state.
+
+## Secret gate before publication
+
+Before every push and PR creation/update, commit the complete candidate and run
+`python3 scripts/secret_gate.py` (native Windows: `python`). Require exit 0;
+missing tooling/authentication, scan errors and skipped scans block publication.
+Then run the existing repository gates. Repeat after changing outgoing commits.
+See [secret scanning](SECRET-SCANNING.md) for base selection, new branches,
+pre-push input and prerequisites. Preserve GitGuardian App, CI and Gitleaks checks.
