@@ -1,11 +1,19 @@
 """Fail-closed ggshield gate for committed PR history or Git pre-push input."""
 
+import sys
+
+# This bootstrap uses only the built-in sys module before enforcing isolation.
+if __name__ == "__main__" and not sys.flags.isolated:
+    sys.stderr.write(
+        "UNAVAILABLE: run this gate with Python -I; publication blocked.\n"
+    )
+    sys.exit(21)
+
 import argparse
 import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
@@ -21,36 +29,153 @@ class GateError(Exception):
         self.message = message
 
 
+def metadata_path(path, anchor):
+    """Confine metadata access, including symlinks, to its allowed Git directory."""
+    try:
+        anchor = anchor.resolve()
+        relative = path.resolve().relative_to(anchor)
+    except (ValueError, OSError, RuntimeError) as error:
+        raise GateError(
+            20, "BASE_ERROR: Git metadata escapes its allowed directory."
+        ) from error
+    return anchor / relative
+
+
+def metadata_text(path, anchor):
+    """Read only a bounded, confined Git metadata record; never display it."""
+    path = metadata_path(path, anchor)
+    with path.open("rb") as stream:
+        data = stream.read(8193)
+    if len(data) > 8192:
+        raise GateError(20, "BASE_ERROR: oversized Git metadata record.")
+    try:
+        return data.decode("utf-8").strip()
+    except UnicodeError as error:
+        raise GateError(
+            20, "BASE_ERROR: unsupported Git metadata path encoding."
+        ) from error
+
+
+def linked_roots(common):
+    """Read registered worktree pointers inside this Git metadata directory."""
+    roots = set()
+    for pointer in (common / "worktrees").glob("*/gitdir"):
+        try:
+            target = (pointer.parent / metadata_text(pointer, common)).resolve()
+        except (OSError, RuntimeError) as error:
+            raise GateError(
+                20, "BASE_ERROR: invalid linked-worktree metadata."
+            ) from error
+        if target.name != ".git":
+            raise GateError(20, "BASE_ERROR: unsupported linked-worktree metadata.")
+        roots.add(target.parent)
+    return roots
+
+
+def checkout_roots():
+    """Read this checkout's standard Git metadata without executing a tool."""
+    cwd = Path.cwd().resolve()
+    root = next((p for p in (cwd, *cwd.parents) if (p / ".git").exists()), None)
+    if root is None:
+        raise GateError(20, "BASE_ERROR: run from the intended Git worktree.")
+    marker = root / ".git"
+    gitdir = marker
+    if marker.is_file():
+        text = metadata_text(marker, root)
+        if not text.startswith("gitdir:") or "\n" in text:
+            raise GateError(20, "BASE_ERROR: unsupported Git worktree metadata.")
+        gitdir = (root / text[len("gitdir:") :].strip()).resolve()
+    gitdir = gitdir.resolve()
+    owner = next((p for p in (gitdir, *gitdir.parents) if p.name == ".git"), None)
+    if owner is None:
+        raise GateError(20, "BASE_ERROR: unsupported Git metadata layout.")
+    common_file = metadata_path(gitdir / "commondir", owner)
+    common = (
+        metadata_path(gitdir / metadata_text(common_file, owner), owner)
+        if common_file.is_file()
+        else gitdir
+    )
+    if not (common / "objects").is_dir():
+        raise GateError(20, "BASE_ERROR: unsupported Git metadata layout.")
+    return (
+        {root, owner.parent, common, gitdir}
+        | linked_roots(common)
+        | linked_roots(owner)
+    )
+
+
+def checkout_owned(path, roots):
+    """Reject code owned by this repository or its linked worktrees."""
+    return any(path.is_relative_to(root) for root in roots)
+
+
+def command_environment():
+    """Bind children to the current checkout and approved import directories."""
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith("PYTHON")
+    }
+    for name in (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_EXEC_PATH",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONUSERBASE",
+        "PYTHONSTARTUP",
+        "PYTHONINSPECT",
+    ):
+        env.pop(name, None)
+    env["PYTHONSAFEPATH"] = "1"
+    return env
+
+
 def executable(name):
     """Resolve approved tools outside the checkout, including on Windows."""
     if name not in {"git", "ggshield"}:
         return None
-    cwd = Path.cwd().resolve()
-    root = next((p for p in (cwd, *cwd.parents) if (p / ".git").exists()), cwd)
+    roots = checkout_roots()
     os.environ["NODEFAULTCURRENTDIRECTORYINEXEPATH"] = "1"
-    directories = []
-    for entry in os.get_exec_path():
-        directory = Path(entry)
-        if directory.is_absolute() and not directory.resolve().is_relative_to(root):
-            directories.append(str(directory.resolve()))
+    directories = [
+        str(Path(entry).resolve())
+        for entry in os.get_exec_path()
+        if Path(entry).is_absolute()
+        and not checkout_owned(Path(entry).resolve(), roots)
+    ]
     os.environ["PATH"] = os.pathsep.join(directories)
-    found = shutil.which(name, path=os.environ["PATH"])
-    if found:
-        resolved = Path(found).resolve()
-        if not resolved.is_relative_to(root):
-            return str(resolved)
+    suffixes = [""]
+    if os.name == "nt":
+        suffixes += os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep)
+    for directory in directories:
+        for suffix in suffixes:
+            # A path containing a directory bypasses Python 3.11's implicit cwd lookup.
+            found = shutil.which(str(Path(directory) / (name + suffix)))
+            if found and not checkout_owned(Path(found).resolve(), roots):
+                return str(Path(found).resolve())
     return None
 
 
 def git(*args):
     """Run Git without interactive authentication or replacement objects."""
-    if not args or not all(re.fullmatch(r"[\w./@{}^~+:-]+", arg) for arg in args):
+    if not args or not all(re.fullmatch(r"[\w./@{}^~+:=,-]+", arg) for arg in args):
         raise GateError(20, "BASE_ERROR: invalid Git argument.")
     tool = executable("git")
     if not tool:
         raise GateError(21, "UNAVAILABLE: install approved Git outside the checkout.")
     env = dict(
-        os.environ,
+        command_environment(),
         GIT_NO_REPLACE_OBJECTS="1",
         GIT_GRAFT_FILE=os.devnull,
         GIT_TERMINAL_PROMPT="0",
@@ -69,8 +194,10 @@ def git(*args):
 
 def commit(ref):
     """Resolve a ref to an immutable commit before selecting history."""
-    if not re.fullmatch(r"(?!-)[\w./@{}^~+-]+", ref):
-        raise GateError(20, "BASE_ERROR: invalid commit reference.")
+    if not re.fullmatch(r"(?!-)[\w./@{}^~+=,-]+", ref):
+        raise GateError(
+            20, "BASE_ERROR: unsupported commit reference; pass a full commit SHA."
+        )
     sha = git("rev-parse", "--verify", "--end-of-options", ref + "^{commit}")
     if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", sha):
         raise GateError(20, "BASE_ERROR: reference did not resolve to one commit.")
@@ -79,7 +206,7 @@ def commit(ref):
 
 def remote_base(remote):
     """Resolve the configured remote default tip without guessing a branch."""
-    if not re.fullmatch(r"(?!-)[\w./-]+", remote):
+    if not re.fullmatch(r"(?!-)[\w./@+=,-]+", remote):
         raise GateError(20, "BASE_ERROR: invalid remote name.")
     if remote not in git("remote").splitlines():
         raise GateError(
@@ -99,6 +226,15 @@ def remote_base(remote):
     )
 
 
+def base_commit(ref):
+    """Require a full destination ref or commit SHA instead of an ambiguous name."""
+    if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", ref):
+        if not ref.startswith("refs/"):
+            raise GateError(20, "BASE_ERROR: --base requires a full ref or commit SHA.")
+        git("check-ref-format", ref)
+    return commit(ref)
+
+
 def ranges(args, stream, head):
     """Select complete PR or pre-push commit ranges."""
     grafts = Path(git("rev-parse", "--git-common-dir")) / "info/grafts"
@@ -111,7 +247,7 @@ def ranges(args, stream, head):
             20, "BASE_ERROR: shallow history; fetch --unshallow before scanning."
         )
     if not args.pre_push:
-        base = commit(args.base) if args.base else None
+        base = base_commit(args.base) if args.base else None
         if not base and not args.all_history:
             base = remote_base(args.remote)
         return [f"{base}..{head}" if base else head]
@@ -133,6 +269,11 @@ def push_range(line):
     _, local, _, old = fields
     if set(local) == {"0"}:
         return None
+    if git("cat-file", "-t", local) == "tag":
+        raise GateError(
+            20,
+            "BASE_ERROR: annotated tags require an approved annotation scan; publication blocked.",
+        )
     head = commit(local)
     # New refs include root history, without a hook commit limit or HEAD~1 guess.
     return head if set(old) == {"0"} else f"{commit(old)}..{head}"
@@ -143,7 +284,9 @@ def scan(revisions, executable):
     # settings from changing this gate. Never persist or forward findings.
     """Run strict ggshield scans and suppress sensitive scanner diagnostics."""
     env = {
-        k: v for k, v in os.environ.items() if not k.startswith(("GITGUARDIAN_", "GG_"))
+        k: v
+        for k, v in command_environment().items()
+        if not k.startswith(("GITGUARDIAN_", "GG_"))
     }
     for key in ("GITGUARDIAN_API_KEY", "GITGUARDIAN_INSTANCE"):
         if key in os.environ:
@@ -156,21 +299,28 @@ def scan(revisions, executable):
         GIT_GRAFT_FILE=os.devnull,
         GIT_TERMINAL_PROMPT="0",
         GCM_INTERACTIVE="Never",
+        GIT_DIR=git("rev-parse", "--absolute-git-dir"),
+        GIT_WORK_TREE=git("rev-parse", "--show-toplevel"),
     )
-    version = subprocess.run(
-        [executable, "--version"],
-        check=False,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    match = re.fullmatch(r"ggshield, version (\d+)\.(\d+)\.(\d+)\s*", version.stdout)
-    if version.returncode or not match:
-        raise GateError(21, "UNAVAILABLE: cannot verify the approved ggshield version.")
-    if not (1, 56, 1) <= tuple(map(int, match.groups())) < (2, 0, 0):
-        raise GateError(21, "UNAVAILABLE: ggshield >=1.56.1,<2 is required.")
     with tempfile.TemporaryDirectory(prefix="secret-gate-") as directory:
+        version = subprocess.run(
+            [executable, "--version"],
+            check=False,
+            env=env,
+            cwd=directory,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        match = re.fullmatch(
+            r"ggshield, version (\d+)\.(\d+)\.(\d+)\s*", version.stdout
+        )
+        if version.returncode or not match:
+            raise GateError(
+                21, "UNAVAILABLE: cannot verify the approved ggshield version."
+            )
+        if not (1, 56, 1) <= tuple(map(int, match.groups())) < (2, 0, 0):
+            raise GateError(21, "UNAVAILABLE: ggshield >=1.56.1,<2 is required.")
         config = Path(directory) / "config.yaml"
         config.write_text(
             "version: 2\nexit_zero: false\nsecret:\n  show_secrets: false\n",
@@ -193,6 +343,7 @@ def scan(revisions, executable):
                 ],
                 check=False,
                 env=env,
+                cwd=directory,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=1800,
@@ -215,13 +366,29 @@ def scan(revisions, executable):
     return 0
 
 
+def verify_snapshot(args, head, selected):
+    """Reject a changed candidate or destination after the scan completes."""
+    if not args.pre_push and head != commit("HEAD"):
+        raise GateError(
+            4,
+            "SCAN_ERROR: HEAD changed; rerun for the new candidate.",
+        )
+    if not args.pre_push and not args.all_history and ".." in selected[0]:
+        scanned_base = selected[0].split("..", 1)[0]
+        current_base = base_commit(args.base) if args.base else remote_base(args.remote)
+        if current_base != scanned_base:
+            raise GateError(
+                4, "SCAN_ERROR: base changed; rerun for the new destination."
+            )
+
+
 def main(argv=None, stream=None):
     """Run the publication gate and return its classified exit status."""
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--base",
-        help="explicit PR base or destination tip, resolved to an immutable commit",
+        help="fully qualified destination ref or full commit SHA",
     )
     mode.add_argument(
         "--all-history",
@@ -259,11 +426,7 @@ def main(argv=None, stream=None):
                 "UNAVAILABLE: install approved ggshield; publication blocked.",
             )
         scan(revisions, scanner)
-        if not args.pre_push and head != commit("HEAD"):
-            raise GateError(
-                4,
-                "SCAN_ERROR: HEAD changed; rerun for the new candidate.",
-            )
+        verify_snapshot(args, head, selected)
         print(
             f"CLEAN: ggshield passed for {sum(n for _, n in revisions)} commit scan(s)."
         )
@@ -271,7 +434,7 @@ def main(argv=None, stream=None):
     except GateError as error:
         print(error.message, file=sys.stderr)
         return error.code
-    except (OSError, ValueError, subprocess.TimeoutExpired):
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
         print(
             "SCAN_ERROR: command failed or timed out; publication blocked.",
             file=sys.stderr,
