@@ -19,6 +19,7 @@ import tempfile
 from pathlib import Path
 
 MINIMUM_PYTHON = (3, 11)
+GITDIR_PREFIX = "gitdir:"
 
 
 class GateError(Exception):
@@ -34,6 +35,11 @@ def metadata_path(path, anchor):
     """Confine metadata access, including symlinks, to its allowed Git directory."""
     try:
         anchor = anchor.resolve()
+        path = path.absolute()
+        if any(
+            p.is_symlink() for p in (path, *path.parents) if p.is_relative_to(anchor)
+        ):
+            raise ValueError("metadata symlink")
         resolved = path.resolve()
         relative = resolved.relative_to(anchor)
         if any(
@@ -75,7 +81,9 @@ def metadata_text(path, anchor):
 
 def metadata_opener(path, flags):
     """Avoid blocking on a FIFO swapped in before descriptor validation."""
-    return os.open(path, flags | getattr(os, "O_NONBLOCK", 0))
+    return os.open(
+        path, flags | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
 
 
 def linked_roots(common):
@@ -86,10 +94,14 @@ def linked_roots(common):
         return roots
     if not registry.is_dir():
         raise GateError(20, "BASE_ERROR: non-directory worktree registry.")
-    for entry in registry.iterdir():
+    try:
+        entries = list(registry.iterdir())
+    except OSError as error:
+        raise GateError(20, "BASE_ERROR: unreadable worktree registry.") from error
+    for entry in entries:
         entry = metadata_path(entry, common)
-        if entry.is_file():
-            continue
+        if not entry.is_dir():
+            raise GateError(20, "BASE_ERROR: non-directory worktree registration.")
         pointer = entry / "gitdir"
         try:
             target = (pointer.parent / metadata_text(pointer, common)).resolve()
@@ -113,9 +125,9 @@ def checkout_roots():
     gitdir = marker
     if marker.is_file():
         text = metadata_text(marker, root)
-        if not text.startswith("gitdir:") or "\n" in text:
+        if not text.startswith(GITDIR_PREFIX) or "\n" in text:
             raise GateError(20, "BASE_ERROR: unsupported Git worktree metadata.")
-        gitdir = (root / text[len("gitdir:") :].strip()).resolve()
+        gitdir = (root / text[len(GITDIR_PREFIX) :].strip()).resolve()
     gitdir = gitdir.resolve()
     owner = next((p for p in (gitdir, *gitdir.parents) if p.name == ".git"), None)
     if owner is None:
@@ -123,7 +135,7 @@ def checkout_roots():
     common_file = metadata_path(gitdir / "commondir", owner)
     common = (
         metadata_path(gitdir / metadata_text(common_file, owner), owner)
-        if common_file.is_file()
+        if common_file.exists()
         else gitdir
     )
     if not (common / "objects").is_dir():
@@ -137,7 +149,18 @@ def checkout_roots():
 
 def checkout_owned(path, roots):
     """Reject code owned by this repository or its linked worktrees."""
-    return any(path.is_relative_to(root) for root in roots)
+    if any(path.is_relative_to(root) for root in roots):
+        return True
+    for directory in (path, *path.parents):
+        marker = directory / ".git"
+        if marker.is_file():
+            text = metadata_text(marker, directory)
+            if not text.startswith(GITDIR_PREFIX) or "\n" in text:
+                raise GateError(20, "BASE_ERROR: unsupported tool-checkout metadata.")
+            gitdir = (directory / text[len(GITDIR_PREFIX) :].strip()).resolve()
+            if any(gitdir.is_relative_to(root) for root in roots):
+                return True
+    return False
 
 
 def command_environment():
@@ -171,7 +194,12 @@ def command_environment():
         "PYTHONINSPECT",
     ):
         env.pop(name, None)
-    for name in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
+    for name in (
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+    ):
         value = env.get(name)
         if value is not None and os.path.normcase(value) != os.path.normcase(
             os.devnull
@@ -182,7 +210,7 @@ def command_environment():
             ):
                 raise GateError(
                     20,
-                    "BASE_ERROR: Git config override requires an approved absolute path "
+                    "BASE_ERROR: Git config/askpass override requires an approved absolute path "
                     "outside the checkout.",
                 )
             env[name] = str(path.resolve())
@@ -283,11 +311,19 @@ def base_commit(ref):
     return commit(ref)
 
 
+def active_grafts(common):
+    """Read confined graft metadata with the documented failure classification."""
+    grafts = metadata_path(common / "info/grafts", common)
+    try:
+        return grafts.exists() and grafts.stat().st_size
+    except OSError as error:
+        raise GateError(20, "BASE_ERROR: unreadable graft metadata.") from error
+
+
 def ranges(args, stream, head):
     """Select complete PR or pre-push commit ranges."""
     common = Path(git("rev-parse", "--git-common-dir"))
-    grafts = metadata_path(common / "info/grafts", common)
-    if (grafts.exists() and grafts.stat().st_size) or os.environ.get("GIT_GRAFT_FILE"):
+    if active_grafts(common) or os.environ.get("GIT_GRAFT_FILE"):
         raise GateError(
             20, "BASE_ERROR: grafted history is unsupported; restore complete history."
         )
