@@ -28,16 +28,86 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 
-def runtime_dir() -> Path:
-    base = os.environ.get("XDG_RUNTIME_DIR")
-    path = Path(base) / "muse-msp-supervisor" if base else Path(f"/tmp/muse-msp-{os.getuid()}")
+def state_dir() -> Path:
+    """Persistent per-user home for durable supervision state.
+
+    Precedence: ``M8S_STATE_DIR`` (explicit override, ``M8S_RUNTIME_DIR``
+    accepted as a deprecated alias), else ``XDG_DATA_HOME/m8s``, else
+    ``~/.local/share/m8s``. The daemon event log, lane roster, budgets,
+    claims, and host registry live here so a tmpfs sweep of the socket
+    dir cannot take supervision state with it.
+    """
+    override = os.environ.get("M8S_STATE_DIR") or os.environ.get("M8S_RUNTIME_DIR")
+    if override:
+        path = Path(override).expanduser()
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+        path = Path(base) / "m8s"
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     return path
 
 
-RUNTIME = runtime_dir()
-SOCKET = RUNTIME / "control.sock"
-PID_FILE = RUNTIME / "daemon.pid"
+def socket_dir() -> Path:
+    """Ephemeral home for the control socket and pid file.
+
+    Precedence: ``M8S_SOCKET_DIR`` (explicit override), else
+    ``XDG_RUNTIME_DIR/muse-msp-supervisor``, else
+    ``/tmp/muse-msp-<uid>``. Only socket lifecycle lives here; durable
+    events and the roster stay in :func:`state_dir`.
+    """
+    override = os.environ.get("M8S_SOCKET_DIR")
+    if override:
+        path = Path(override).expanduser()
+    else:
+        base = os.environ.get("XDG_RUNTIME_DIR")
+        path = Path(base) / "muse-msp-supervisor" if base else Path(f"/tmp/muse-msp-{os.getuid()}")
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return path
+
+
+def runtime_dir() -> Path:
+    """Legacy alias: the durable state home (was the tmpfs runtime dir)."""
+    return state_dir()
+
+
+def init_runtime(
+    state: str | Path | None = None,
+    socket: str | Path | None = None,
+) -> dict[str, Path]:
+    """Rebind runtime paths, e.g. for ``up --state-dir`` or tests.
+
+    Only the runtime/startup/persistence seam: re-points the durable
+    state home and the ephemeral socket home plus every derived path.
+    Returns the bound ``{"state": ..., "socket": ...}`` dirs.
+    """
+    global RUNTIME, SOCKET, PID_FILE, EVENTS, DAEMON_LOG
+    global BUDGETS_FILE, SESSIONS_FILE, RETIRED_FILE, HOSTS_FILE
+    global CLAIMS_FILE, BUS_LOG, WEB_TOKEN_FILE, WEB_COORD_FILE
+    if state is not None:
+        os.environ["M8S_STATE_DIR"] = str(state)
+    if socket is not None:
+        os.environ["M8S_SOCKET_DIR"] = str(socket)
+    RUNTIME = state_dir()
+    sock_home = socket_dir()
+    SOCKET = sock_home / "control.sock"
+    PID_FILE = sock_home / "daemon.pid"
+    EVENTS = RUNTIME / "events.ndjson"
+    DAEMON_LOG = RUNTIME / "daemon.log"
+    BUDGETS_FILE = RUNTIME / "budgets.json"
+    SESSIONS_FILE = RUNTIME / "sessions.json"
+    RETIRED_FILE = RUNTIME / "retired.json"
+    HOSTS_FILE = RUNTIME / "hosts.json"
+    CLAIMS_FILE = RUNTIME / "claims.json"
+    BUS_LOG = RUNTIME / "bus.ndjson"
+    WEB_TOKEN_FILE = RUNTIME / "web.token"
+    WEB_COORD_FILE = RUNTIME / "web.coordinator"
+    return {"state": RUNTIME, "socket": sock_home}
+
+
+RUNTIME = state_dir()
+SOCKET_DIR = socket_dir()
+SOCKET = SOCKET_DIR / "control.sock"
+PID_FILE = SOCKET_DIR / "daemon.pid"
 EVENTS = RUNTIME / "events.ndjson"
 DAEMON_LOG = RUNTIME / "daemon.log"
 
@@ -172,6 +242,11 @@ def emit_local(record: dict[str, Any]) -> dict[str, Any]:
     record = {"at": time.time(), **record}
     with EVENTS.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
     return record
 
 
@@ -201,11 +276,26 @@ def save_roster(
     aliases: dict[str, str],
     path: Path = SESSIONS_FILE,
 ) -> None:
-    path.write_text(
-        json.dumps({"sessions": sessions, "aliases": aliases}, sort_keys=True)
-        + "\n",
-        encoding="utf-8",
-    )
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps({"sessions": sessions, "aliases": aliases}, sort_keys=True) + "\n")
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
+    os.replace(tmp, path)
+    try:
+        fd = os.open(str(path.parent), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def load_roster(
@@ -961,6 +1051,11 @@ def publish(subject: str, message: dict[str, Any]) -> dict[str, Any]:
             json.dumps({"subject": subject, "message": message}, separators=(",", ":"))
             + "\n"
         )
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
     return message
 
 
@@ -3707,6 +3802,8 @@ async def handle_client(host: MspHost, reader: asyncio.StreamReader, writer: asy
 
 
 async def serve() -> int:
+    RUNTIME.mkdir(mode=0o700, parents=True, exist_ok=True)
+    SOCKET.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if SOCKET.exists():
         SOCKET.unlink()
     PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
@@ -3743,9 +3840,58 @@ def daemon_running() -> bool:
         return False
 
 
-def start_daemon() -> dict[str, Any]:
+def live_serve_pids(proc_root: str | Path = "/proc") -> list[int]:
+    """PIDs whose cmdline looks like this supervisor's ``serve`` process.
+
+    Used to detect a running-but-unreachable predecessor (e.g. the socket
+    dir was swept while the daemon survived) without touching any daemon.
+    ``proc_root`` is a seam for tests; absent/unreadable trees yield [].
+    """
+    self_pid = os.getpid()
+    found: list[int] = []
+    try:
+        entries = sorted(Path(proc_root).iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == self_pid:
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        text = b" ".join(raw).decode("utf-8", "replace")
+        if "muse-msp.py" in text and "serve" in text:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                continue
+            found.append(pid)
+    return found
+
+
+def predecessor_pids(proc_root: str | Path = "/proc") -> list[int]:
+    """Live predecessor pids while the control socket is unreachable."""
+    if daemon_running():
+        return []
+    return live_serve_pids(proc_root)
+
+
+def start_daemon(force: bool = False, proc_root: str | Path = "/proc") -> dict[str, Any]:
     if daemon_running():
         return {"running": True, "pid": int(PID_FILE.read_text())}
+    orphans = live_serve_pids(proc_root)
+    if orphans and not force:
+        raise RuntimeError(
+            "running-but-unreachable predecessor detected "
+            f"(pids={sorted(orphans)}); control socket {SOCKET} is unreachable, "
+            "so starting a second supervisor would split the world. "
+            "Stop the predecessor (or remove its socket dir sweep) and retry, "
+            "or pass `up --force` to start anyway."
+        )
     SOCKET.unlink(missing_ok=True)
     PID_FILE.unlink(missing_ok=True)
     with DAEMON_LOG.open("ab") as log:
@@ -5360,7 +5506,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("serve", help=argparse.SUPPRESS)
-    sub.add_parser("up", help="start the MSP controller daemon")
+    up = sub.add_parser("up", help="start the MSP controller daemon")
+    up.add_argument("--state-dir", default=None, help="override durable state home (env M8S_STATE_DIR)")
+    up.add_argument("--socket-dir", default=None, help="override control socket home (env M8S_SOCKET_DIR)")
+    up.add_argument("--force", action="store_true", help="start even with a running-but-unreachable predecessor")
     sub.add_parser("down", help="stop the MSP controller daemon")
     sub.add_parser(
         "reload",
@@ -5876,7 +6025,12 @@ def main() -> int:
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     if args.command == "up":
-        result = start_daemon()
+        if getattr(args, "state_dir", None) or getattr(args, "socket_dir", None):
+            init_runtime(state=getattr(args, "state_dir", None), socket=getattr(args, "socket_dir", None))
+        try:
+            result = start_daemon(force=bool(getattr(args, "force", False)))
+        except RuntimeError as exc:
+            raise SystemExit(str(exc))
     elif args.command == "web":
         return run_web(args.bind, args.port, args.allow_remote)
     else:
