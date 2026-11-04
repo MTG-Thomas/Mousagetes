@@ -178,6 +178,53 @@ class AgentMappingIntegrationTest(unittest.TestCase):
         # Sanity: the mapping really went through the daemon for the prompt.
         self.assertIn("send", [c.get("command") for c in control.calls])
 
+    def run_permission(self, *outcomes: dict) -> tuple[list[dict], list[dict]]:
+        class PermissionControl(FakeControl):
+            answered = False
+
+            def request(self, request):
+                if request.get("command") == "pending":
+                    self.calls.append(request)
+                    return {"approvals": [] if self.answered else [{
+                        "approvalId": "a1", "currentRequirementId": "r1",
+                        "availableChoices": [{"choiceId": "allow", "label": "Allow once"}],
+                    }]}
+                if request.get("method") == "approval/decide":
+                    self.answered = True
+                return super().request(request)
+
+            def _page(self):
+                if self.sent and not self.answered:
+                    return {"events": [], "nextCursor": None}
+                return super()._page()
+
+        control = PermissionControl()
+        mapping = DaemonMapping(control, poll_interval=0, sleep=lambda _s: None, max_polls=5)
+        messages = [{"jsonrpc": "2.0", "id": 1, "method": "session/prompt",
+                     "params": {"sessionId": "s1", "prompt": [{"type": "text", "text": "go"}]}}]
+        messages.extend({"jsonrpc": "2.0", "id": f"m8s-{i}", "result": {"outcome": outcome}}
+                        for i, outcome in enumerate(outcomes, 1))
+        stdin = io.StringIO("\n".join(json.dumps(m) for m in messages) + "\n")
+        stdout = io.StringIO()
+        serve_stdio(mapping, stdin, stdout)
+        return [json.loads(line) for line in stdout.getvalue().splitlines()], control.calls
+
+    def test_refused_choice_reoffers_in_same_prompt(self) -> None:
+        out, calls = self.run_permission(
+            {"outcome": "selected", "optionId": "stale"},
+            {"outcome": "selected", "optionId": "allow"},
+        )
+        self.assertEqual(sum(c.get("command") == "send" for c in calls), 1)
+        self.assertEqual(sum(c.get("method") == "approval/decide" for c in calls), 1)
+        self.assertEqual(sum(m.get("method") == "session/request_permission" for m in out), 2)
+        self.assertEqual(next(m for m in out if m.get("id") == 1)["result"]["stopReason"], "end_turn")
+
+    def test_permission_cancellation_never_becomes_choice(self) -> None:
+        out, calls = self.run_permission({"outcome": "cancelled"})
+        self.assertFalse(any(c.get("method") == "approval/decide" for c in calls))
+        self.assertEqual(sum(c.get("method") == "turn/cancel" for c in calls), 1)
+        self.assertEqual(next(m for m in out if m.get("id") == 1)["result"]["stopReason"], "cancelled")
+
 
 if __name__ == "__main__":
     unittest.main()

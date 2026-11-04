@@ -2080,6 +2080,78 @@ class RetireError(ValueError):
         self.kind = kind
 
 
+class ApprovalError(ValueError):
+    """Typed approval-decision error (issue #34): refusing a stale/invalid choice.
+
+    ``kind`` is machine-readable: "approvalNotFound" (no such approvalId in
+    the current ``approval/listPending`` listing — stale state, fail closed)
+    or "invalidChoice" (choiceId not in the current offered
+    ``availableChoices``). Raised before any ``approval/decide`` wire call,
+    so an invalid choice never decides on the wire.
+    """
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+def approval_offered_choices(approval: Any) -> set[str] | None:
+    """Offered ``availableChoices`` ids, or None when nothing constrains us.
+
+    Normalizes string entries and dicts carrying ``choiceId``/``id``. A
+    missing or empty ``availableChoices`` means the record
+    advertises no constraint, so the decide passes through unchecked
+    (preserves the documented checked-caller flow for servers that do not
+    advertise choices). Malformed entries are skipped; an explicitly
+    malformed constraint never disables the membership check.
+    """
+    if not isinstance(approval, dict):
+        return None
+    raw = approval.get("availableChoices")
+    if raw is None or raw == []:
+        return None
+    if not isinstance(raw, list):
+        return set()
+    offered: set[str] = set()
+    for choice in raw:
+        if isinstance(choice, str):
+            if choice:
+                offered.add(choice)
+        elif isinstance(choice, dict):
+            cid = choice.get("choiceId")
+            if cid is None:
+                cid = choice.get("id")
+            if cid is not None and str(cid):
+                offered.add(str(cid))
+    # An explicitly advertised but malformed list must never disable the
+    # membership check. Only a missing or empty list means unconstrained.
+    return offered
+
+
+def find_pending_approval(pending_result: Any, approval_id: str) -> dict[str, Any] | None:
+    """Find one approval by id in an ``approval/listPending`` result.
+
+    The exact reply shape is server-defined, so the ``approvals``,
+    ``pendingApprovals``, and ``pending`` list fields are all honored.
+    Returns None when the approval is absent (stale state).
+    """
+    if not isinstance(pending_result, dict):
+        return None
+    for key in ("approvals", "pendingApprovals", "pending"):
+        entries = pending_result.get(key)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            candidate = entry.get("approvalId")
+            if candidate is None:
+                candidate = entry.get("requestId") or entry.get("id")
+            if candidate is not None and str(candidate) == approval_id:
+                return entry
+    return None
+
+
 def validate_call(
     method: str,
     params: dict[str, Any] | None = None,
@@ -2895,6 +2967,35 @@ class MspHost:
                 f"model {wanted} is outside the lane budget {models}",
             )
 
+    async def check_approval_choice(
+        self, session_id: str, approval_id: str, choice_id: str
+    ) -> None:
+        """Validate a choice against the currently offered ``availableChoices``.
+
+        Reads the live ``approval/listPending`` state and raises ApprovalError
+        before any ``approval/decide`` wire call: "approvalNotFound" when the
+        approval is absent (stale state, fail closed), "invalidChoice" when
+        the choice is not currently offered. A record that advertises no
+        constraint (missing/empty ``availableChoices``) passes through, so
+        checked callers that already offer only valid choices are unaffected.
+        A ``listPending`` transport failure propagates with no decide sent
+        (fail closed).
+        """
+        pending_result = await self.call("approval/listPending", {"sessionId": session_id})
+        approval = find_pending_approval(pending_result, approval_id)
+        if approval is None:
+            raise ApprovalError(
+                "approvalNotFound",
+                f"approval {approval_id!r} is not pending on {session_id!r}; refusing a stale decide",
+            )
+        offered = approval_offered_choices(approval)
+        if offered is not None and choice_id not in offered:
+            raise ApprovalError(
+                "invalidChoice",
+                f"choice {choice_id!r} is not in the offered choices {sorted(offered)} "
+                f"for approval {approval_id!r}",
+            )
+
     async def supervised_call(
         self,
         method: str,
@@ -2912,13 +3013,26 @@ class MspHost:
         (unknown method / missing-but-required commandId raises
         CallValidationError with no round-trip), and enforces lane budgets:
         new turns on over-budget lanes and setModel outside the allowlist
-        raise BudgetExceededError.
+        raise BudgetExceededError. An ``approval/decide`` choice is checked
+        against the currently offered ``availableChoices`` first (issue #34):
+        a stale approval or an un-offered choice raises ApprovalError with
+        no decide on the wire.
         """
         validate_call(method, params, command_id)
         merged = dict(params or {})
         if command_id != "off" and method in COMMAND_METHODS and "commandId" not in merged:
             merged["commandId"] = uuid7() if command_id in (None, "auto") else command_id
         session_id = merged.get("sessionId")
+        if method == "approval/decide":
+            approval_id = merged.get("approvalId")
+            choice_id = merged.get("choiceId")
+            if not isinstance(session_id, str) or not session_id:
+                raise ApprovalError("approvalNotFound", "approval/decide requires sessionId")
+            if not isinstance(approval_id, str) or not approval_id:
+                raise ApprovalError("approvalNotFound", "approval/decide requires approvalId")
+            if not isinstance(choice_id, str) or not choice_id:
+                raise ApprovalError("invalidChoice", "approval/decide requires choiceId")
+            await self.check_approval_choice(session_id, approval_id, choice_id)
         if session_id:
             if session_id in self._retired_ids():
                 raise RetireError(

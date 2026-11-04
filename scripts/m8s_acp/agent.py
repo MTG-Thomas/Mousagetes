@@ -120,6 +120,7 @@ class Agent:
         self._responses: dict[Any, dict[str, Any]] = {}
         self._deferred: list[tuple[Any, str, dict[str, Any]]] = []
         self._active_prompts: set[str] = set()
+        self._cancelled_prompts: set[str] = set()
         self._server_seq = 0
 
     # -- lifecycle --------------------------------------------------------
@@ -210,7 +211,12 @@ class Agent:
 
     def _handle_notification(self, method: str, params: dict[str, Any]) -> None:
         if method == "session/cancel":
-            self._mapping.cancel(str(params.get("sessionId") or ""))
+            self._cancel_prompt(str(params.get("sessionId") or ""))
+
+    def _cancel_prompt(self, lane_id: str) -> None:
+        if lane_id not in self._cancelled_prompts:
+            self._mapping.cancel(lane_id)
+            self._cancelled_prompts.add(lane_id)
 
     # -- ACP behaviours ---------------------------------------------------
 
@@ -258,18 +264,28 @@ class Agent:
         text = _prompt_text(params.get("prompt"))
         stop_reason = "end_turn"
         self._active_prompts.add(lane_id)
+        self._cancelled_prompts.discard(lane_id)
         try:
             for event in self._mapping.prompt(lane_id, text):
                 if event.kind == contract.UPDATE:
                     self._emit_update(lane_id, _update_payload(event.data))
                 elif event.kind == contract.PERMISSION:
-                    if not self._relay_permission(lane_id, event.data):
-                        self._mapping.cancel(lane_id)
+                    try:
+                        relayed = self._relay_permission(lane_id, event.data)
+                    except Exception as exc:
+                        if getattr(exc, "kind", None) in ("invalidChoice", "approvalNotFound"):
+                            # The real mapping clears its emitted marker so
+                            # the next poll can offer fresh choices in this
+                            # same prompt, without starting another turn.
+                            continue
+                        raise
+                    if not relayed:
+                        self._cancel_prompt(lane_id)
                         stop_reason = "cancelled"
                         break
                 elif event.kind == contract.QUESTION:
                     if not self._relay_question(lane_id, event.data):
-                        self._mapping.cancel(lane_id)
+                        self._cancel_prompt(lane_id)
                         stop_reason = "cancelled"
                         break
                 elif event.kind == contract.STOP:
@@ -294,9 +310,13 @@ class Agent:
             return False
         outcome = (response.get("result") or {}).get("outcome") or {}
         if outcome.get("outcome") == "selected":
-            option_id = str(outcome.get("optionId") or "cancelled")
+            option_id = outcome.get("optionId")
+            if not isinstance(option_id, str) or not option_id:
+                raise ValueError("selected permission outcome requires optionId")
         else:
-            option_id = "cancelled"
+            # ACP cancellation is a prompt cancellation, not an approval
+            # choice. Never invent an unoffered choiceId on the MSP wire.
+            return False
         self._mapping.answer_permission(
             lane_id, str(data.get("requestId") or request_id), option_id
         )

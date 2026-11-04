@@ -449,5 +449,125 @@ class StuckDetectionTest(unittest.TestCase):
                 os.environ["M8S_STUCK_AFTER_SECONDS"] = old
 
 
+class ApprovalHost(FakeHost):
+    """Fake transport with a canned approval/listing (issue #34)."""
+
+    def __init__(self, approvals) -> None:
+        super().__init__()
+        self.pending_approvals = approvals
+
+    async def call(self, method: str, params: dict | None = None):
+        self.calls.append((method, dict(params or {})))
+        if method == "approval/listPending":
+            return {"approvals": self.pending_approvals, "userInputs": []}
+        return {"ok": True}
+
+    def decide_calls(self):
+        return [params for method, params in self.calls if method == "approval/decide"]
+
+
+def decide(host, session="session-1", approval="a1", choice="allow"):
+    return run(
+        host.supervised_call(
+            "approval/decide",
+            {"sessionId": session, "approvalId": approval, "choiceId": choice},
+        )
+    )
+
+
+class ApprovalChoiceTest(unittest.TestCase):
+    OFFERED = {
+        "approvalId": "a1",
+        "currentRequirementId": "r1",
+        "availableChoices": [
+            {"choiceId": "allow", "label": "Allow once"},
+            {"choiceId": "deny", "label": "Reject"},
+        ],
+    }
+
+    def test_valid_choice_passes_through_to_wire(self) -> None:
+        host = ApprovalHost([dict(self.OFFERED)])
+        decide(host, choice="allow")
+        self.assertEqual(len(host.decide_calls()), 1)
+        self.assertEqual(host.decide_calls()[0]["choiceId"], "allow")
+        self.assertEqual(host.decide_calls()[0]["approvalId"], "a1")
+
+    def test_invalid_choice_is_typed_with_no_wire_decide(self) -> None:
+        host = ApprovalHost([dict(self.OFFERED)])
+        with self.assertRaises(muse_msp.ApprovalError) as ctx:
+            decide(host, choice="maybe")
+        self.assertEqual(ctx.exception.kind, "invalidChoice")
+        self.assertIn("allow", str(ctx.exception))
+        self.assertIn("deny", str(ctx.exception))
+        self.assertEqual(host.decide_calls(), [])
+
+    def test_stale_approval_fails_closed_with_no_wire_decide(self) -> None:
+        host = ApprovalHost([])
+        with self.assertRaises(muse_msp.ApprovalError) as ctx:
+            decide(host, choice="allow")
+        self.assertEqual(ctx.exception.kind, "approvalNotFound")
+        self.assertEqual(host.decide_calls(), [])
+
+    def test_superseded_approval_fails_closed(self) -> None:
+        host = ApprovalHost([{"approvalId": "a2", "availableChoices": ["allow"]}])
+        with self.assertRaises(muse_msp.ApprovalError) as ctx:
+            decide(host, approval="a1", choice="allow")
+        self.assertEqual(ctx.exception.kind, "approvalNotFound")
+        self.assertEqual(host.decide_calls(), [])
+
+    def test_unadvertised_choices_pass_through(self) -> None:
+        # Servers that do not advertise availableChoices keep the
+        # documented checked-caller passthrough: the decide goes out.
+        for approval in ({"approvalId": "a1"}, {"approvalId": "a1", "availableChoices": []}):
+            with self.subTest(approval=approval):
+                host = ApprovalHost([approval])
+                decide(host, choice="allow")
+                self.assertEqual(len(host.decide_calls()), 1)
+
+    def test_offered_choices_normalization(self) -> None:
+        self.assertEqual(
+            muse_msp.approval_offered_choices(
+                {"availableChoices": ["allow", {"choiceId": "deny"}, {"id": "always"}]}
+            ),
+            {"allow", "deny", "always"},
+        )
+        self.assertIsNone(muse_msp.approval_offered_choices({"approvalId": "a1"}))
+        self.assertIsNone(muse_msp.approval_offered_choices({"availableChoices": []}))
+        self.assertEqual(muse_msp.approval_offered_choices({"availableChoices": [42, {}]}), set())
+        self.assertIsNone(muse_msp.approval_offered_choices(None))
+
+    def test_malformed_advertised_choices_never_decide(self) -> None:
+        host = ApprovalHost([{"approvalId": "a1", "availableChoices": [42, {}]}])
+        with self.assertRaises(muse_msp.ApprovalError) as ctx:
+            decide(host)
+        self.assertEqual(ctx.exception.kind, "invalidChoice")
+        self.assertEqual(host.decide_calls(), [])
+
+    def test_falsey_decide_identifiers_never_reach_wire(self) -> None:
+        host = ApprovalHost([{"approvalId": "a1", "availableChoices": ["allow"]}])
+        for field, value, kind in (
+            ("sessionId", "", "approvalNotFound"),
+            ("approvalId", "", "approvalNotFound"),
+            ("choiceId", "", "invalidChoice"),
+            ("choiceId", None, "invalidChoice"),
+        ):
+            with self.subTest(field=field, value=value):
+                params = {"sessionId": "session-1", "approvalId": "a1", "choiceId": "allow"}
+                params[field] = value
+                with self.assertRaises(muse_msp.ApprovalError) as ctx:
+                    asyncio.run(host.supervised_call("approval/decide", params))
+                self.assertEqual(ctx.exception.kind, kind)
+        self.assertEqual(host.decide_calls(), [])
+
+    def test_find_pending_approval_shapes(self) -> None:
+        approval = {"approvalId": "a1"}
+        self.assertEqual(muse_msp.find_pending_approval({"approvals": [approval]}, "a1"), approval)
+        self.assertEqual(
+            muse_msp.find_pending_approval({"pendingApprovals": [approval]}, "a1"), approval
+        )
+        self.assertIsNone(muse_msp.find_pending_approval({"approvals": []}, "a1"))
+        self.assertIsNone(muse_msp.find_pending_approval({}, "a1"))
+
+
 if __name__ == "__main__":
     unittest.main()
