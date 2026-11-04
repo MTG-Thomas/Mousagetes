@@ -401,6 +401,43 @@ class UnloadTest(unittest.TestCase):
         )
         self.assertNotIn("activeTurn", host.sessions["session-1"])
 
+    def test_unqueued_matching_turn_clears_marker(self) -> None:
+        # Issue #33: a won reclaim (turn/unqueued notification) clears the
+        # stale activeTurn and records terminal reclaim evidence the same
+        # way turn/completed records its terminal (lastTerminal + msp.event
+        # so turn/-prefixed client filters keep working).
+        host = FakeHost()
+        asyncio.run(host.submit("lane", "do work"))
+        self.assertEqual(host.sessions["session-1"].get("activeTurn"), "turn-9")
+        asyncio.run(
+            host._notification(
+                "turn/unqueued", {"sessionId": "session-1", "turnId": "turn-9"}
+            )
+        )
+        self.assertNotIn("activeTurn", host.sessions["session-1"])
+        self.assertEqual(host.sessions["session-1"].get("lastTerminal"), "unqueued")
+        methods = [
+            e["method"] for e in host.events if e.get("kind") == "msp.event"
+        ]
+        self.assertIn("turn/unqueued", methods)
+
+    def test_unqueued_other_turn_preserves_marker(self) -> None:
+        # A reclaim for another turn must not clobber the live turn, but
+        # the terminal reclaim evidence is still recorded.
+        host = FakeHost()
+        host.sessions["session-1"]["activeTurn"] = "turn-live"
+        asyncio.run(
+            host._notification(
+                "turn/unqueued", {"sessionId": "session-1", "turnId": "turn-queued"}
+            )
+        )
+        self.assertEqual(host.sessions["session-1"].get("activeTurn"), "turn-live")
+        self.assertEqual(host.sessions["session-1"].get("lastTerminal"), "unqueued")
+        methods = [
+            e["method"] for e in host.events if e.get("kind") == "msp.event"
+        ]
+        self.assertIn("turn/unqueued", methods)
+
     def test_cli_builds_unload_request(self) -> None:
         req = muse_msp.build_request(parse(["unload", "lane"]))
         self.assertEqual(
