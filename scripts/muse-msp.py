@@ -2104,6 +2104,34 @@ def validate_call(
         )
 
 
+HOST_CALL_TIMEOUT_SECONDS = 60
+
+
+class HostTimeoutError(TimeoutError):
+    """Typed timeout for one MSP host round-trip (issue #37).
+
+    Raised by :meth:`MspHost.call` when the serve host does not answer
+    within ``HOST_CALL_TIMEOUT_SECONDS``. ``kind`` is "hostTimeout" so
+    the existing control boundary (``handle_client`` mapping ``.kind``
+    to ``errorKind``) surfaces it typed instead of the empty
+    ``str(asyncio.TimeoutError())``. Carries the MSP ``method`` and the
+    configured ``timeout``; performs no retry (a timed-out mutation has
+    uncertain outcome, so the caller decides).
+
+    Integration seam with PR #38: that lane types remote error *frames*
+    via ``MspWireError`` (classified from the generated SDK error table).
+    This type covers the opposite case — a *local* timeout with no frame
+    at all — so the names, kinds, and constructors deliberately do not
+    overlap; both ride the same ``errorKind`` control channel.
+    """
+
+    def __init__(self, method: str, timeout: float) -> None:
+        super().__init__(f"host timed out waiting for {method!r} after {timeout:g}s")
+        self.kind = "hostTimeout"
+        self.method = method
+        self.timeout = timeout
+
+
 class MspHost:
     def __init__(self) -> None:
         self.proc: asyncio.subprocess.Process | None = None
@@ -2239,7 +2267,13 @@ class MspHost:
         if params is not None:
             frame["params"] = params
         await self._write(frame)
-        return await asyncio.wait_for(future, timeout=60)
+        try:
+            return await asyncio.wait_for(future, timeout=HOST_CALL_TIMEOUT_SECONDS)
+        except (asyncio.TimeoutError, TimeoutError):
+            self.pending.pop(request_id, None)
+            if not future.done():
+                future.cancel()
+            raise HostTimeoutError(method, HOST_CALL_TIMEOUT_SECONDS) from None
 
     async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         frame: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
